@@ -1,0 +1,66 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.simpsonsswift.emulator'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.simpsonsswift.emulator'
+        minSdk 23
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0'
+
+        // The workflow builds these four Rust targets and puts each executable
+        // in jniLibs so Android installs the matching one in nativeLibraryDir.
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // A signed, installable sideload APK. Replace this with a private
+            // release key before publishing through an app store.
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // Keep the executables as real files under nativeLibraryDir. The
+            // launcher starts the matching Rust binary as a child process.
+            useLegacyPackaging = true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+def supportedAbis = ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86']
+
+tasks.register('verifyRustEmulatorBinaries') {
+    group = 'verification'
+    description = 'Fail packaging if any Android ABI is missing its Rust emulator executable.'
+    doLast {
+        def missing = supportedAbis.collect { abi ->
+            file("src/main/jniLibs/${abi}/libsimpsons-emu.so")
+        }.findAll { !it.isFile() }
+        if (!missing.isEmpty()) {
+            throw new GradleException(
+                "Missing Android Rust executable(s): ${missing.join(', ')}. " +
+                'Build the Android targets and stage them under app/src/main/jniLibs/<abi>/libsimpsons-emu.so.'
+            )
+        }
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn tasks.named('verifyRustEmulatorBinaries')
+}

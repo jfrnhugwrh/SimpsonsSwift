@@ -2,6 +2,15 @@
 target/
 emulator/target/
 
+# Android workflow-generated Rust executables staged before Gradle packaging
+android/app/src/main/jniLibs/*/libsimpsons-emu.so
+
+# Gradle/Android build output and machine-local SDK settings
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+
 # Python bytecode (tools/gen_unicorn_golden.py)
 __pycache__/
 *.pyc
