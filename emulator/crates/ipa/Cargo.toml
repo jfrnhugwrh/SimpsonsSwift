@@ -1,0 +1,17 @@
+[package]
+name = "ipa"
+description = "IPA (iOS app package) reader, validator and importer for the Simpsons Arcade iOS emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Like every other crate in this workspace this one is `std`-only and has no
+# external dependencies: the ZIP reader, the DEFLATE inflater and the plist
+# parser below are all part of the crate so that `cargo build --offline` keeps
+# working.
+[dependencies]
+macho = { path = "../macho" }
+
+[lib]
+name = "ipa"
+path = "src/lib.rs"

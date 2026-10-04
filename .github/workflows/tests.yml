@@ -1,0 +1,50 @@
+# Test the emulator workspace.
+#
+# Deliberately *not* triggered on push: the Android build is manual-only and the
+# test suite runs on pull requests and on demand, so a branch under construction
+# does not queue a runner for every commit.
+name: Tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: emulator
+    steps:
+      - uses: actions/checkout@v4
+
+      # The workspace has no third-party dependencies, so there is no registry
+      # fetch to warm; the cache step just keeps the compiled crates.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: emulator
+
+      - name: Toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # The 334 differential instruction cases, the per-crate suites, the IPA
+      # importer's tests and the end-to-end runtime tests.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --workspace --release

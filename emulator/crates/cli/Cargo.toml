@@ -10,6 +10,7 @@ macho = { path = "../macho" }
 guestmem = { path = "../guestmem" }
 arm = { path = "../arm" }
 runtime = { path = "../runtime" }
+ipa = { path = "../ipa" }
 
 [[bin]]
 name = "simpsons-emu"

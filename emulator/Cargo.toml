@@ -11,6 +11,7 @@ members = [
     "crates/guestmem",
     "crates/arm",
     "crates/runtime",
+    "crates/ipa",
     "crates/cli",
 ]
 

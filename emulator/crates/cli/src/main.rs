@@ -1,11 +1,18 @@
 //! `simpsons-emu` — command line frontend.
 //!
 //! ```
+//! simpsons-emu import "The Simpsons Arcade v1.1.43.ipa"  # validate + extract your own copy
+//! simpsons-emu games                                     # what is in the game library
 //! simpsons-emu info  Simpsons.app/Simpsons       # load commands, segments, imports
 //! simpsons-emu dump  Simpsons.app/Simpsons       # hexdump of the image
 //! simpsons-emu run   Simpsons.app/Simpsons       # boot it, with a boot trace
 //! simpsons-emu run   Simpsons.app/Simpsons --serve 8080   # live framebuffer preview
+//! simpsons-emu run   "The Simpsons Arcade v1.1.43.ipa"    # import on demand, then boot
 //! ```
+//!
+//! `info`, `dump` and `run` all accept an `.ipa` in place of a Mach-O: the
+//! archive is validated, extracted into the game library and the extracted
+//! executable is what gets loaded.
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -13,19 +20,35 @@ use std::sync::{Arc, Mutex};
 use macho::{MachO, CPU_TYPE_ARM};
 use runtime::{LoadOptions, Machine, StopReason};
 
+mod import;
 mod serve;
 
 const USAGE: &str = "\
 simpsons-emu — The Simpsons Arcade (iOS, ARMv7) emulator
 
 USAGE:
-    simpsons-emu info  <binary> [--verbose]
-    simpsons-emu dump  <binary> [--section __TEXT.__text] [--offset N] [--length N]
-    simpsons-emu run   <binary> [options]
+    simpsons-emu import <file.ipa> [options]    Validate and extract your own copy of the game
+    simpsons-emu games [--dest <dir>]           List the imported games
+    simpsons-emu info  <binary|ipa> [--verbose]
+    simpsons-emu dump  <binary|ipa> [--section __TEXT.__text] [--offset N] [--length N]
+    simpsons-emu run   <binary|ipa> [options]
+
+IMPORT OPTIONS:
+    --dest <dir>              Game library to import into (default: $XDG_DATA_HOME/simpsons-emu/games)
+    --app <name>              Which bundle to use when the archive holds more than one
+    --force                   Re-extract over an existing import
+    --allow-other-app         Import an IPA that is a valid iOS app but not this game
+
+The emulator does not ship, download or distribute the game.  The .ipa has to be a
+copy you obtained legally, and it must be decrypted (App Store packages are
+FairPlay encrypted and no emulator can read them).
 
 RUN OPTIONS:
     --args <a> [b ...]        Arguments passed to the guest's main()
     --bundle <dir>            Directory the game's assets are loaded from
+    --dest <dir>              Game library an .ipa argument is imported into
+    --app <name>              Which bundle to use when the .ipa holds more than one
+    --allow-other-app         Import an .ipa that is a valid iOS app but not this game
     --max-insns <n>           Instruction budget (default 200000000)
     --slice <n>               Instructions between frame publishes (default 2000000)
     --trace                   Log every HLE call and syscall
@@ -43,6 +66,8 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let result = match args[0].as_str() {
+        "import" => import::cmd_import(&args[1..]),
+        "games" | "list" => import::cmd_games(&args[1..]),
         "info" => cmd_info(&args[1..]),
         "dump" => cmd_dump(&args[1..]),
         "run" => cmd_run(&args[1..]),
@@ -82,7 +107,7 @@ fn flag_summary(flags: u32) -> String {
     }
 }
 
-fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
 }
 
@@ -120,7 +145,11 @@ fn load(path: &str) -> Result<MachO, String> {
 // ---------------------------------------------------------------------------
 
 fn cmd_info(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("info: missing <binary>")?;
+    let target = import::resolve(args, "info")?;
+    for note in &target.notes {
+        println!("{note}");
+    }
+    let path = target.binary.as_str();
     let verbose = args.iter().any(|a| a == "--verbose");
     let image = load(path)?;
 
@@ -234,8 +263,11 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn cmd_dump(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("dump: missing <binary>")?;
-    let image = load(path)?;
+    let target = import::resolve(args, "dump")?;
+    for note in &target.notes {
+        println!("{note}");
+    }
+    let image = load(&target.binary)?;
     let bytes = &image.data;
 
     let (start, length) = if let Some(section) = flag(args, "--section") {
@@ -283,7 +315,11 @@ fn cmd_dump(args: &[String]) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("run: missing <binary>")?.clone();
+    let target = import::resolve(args, "run")?;
+    for note in &target.notes {
+        println!("{note}");
+    }
+    let path = target.binary.clone();
     let image = load(&path)?;
 
     let mut options = LoadOptions::default();
@@ -291,8 +327,13 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.clone());
     options.args = command_line(args);
-    if let Some(bundle) = flag(args, "--bundle") {
-        options.program_name = format!("{}/Simpsons", bundle.trim_end_matches('/'));
+    if let Some(bundle) = target.bundle {
+        // argv[0] is the executable inside the bundle, the way iOS sets it up.
+        let executable = std::path::Path::new(&path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Simpsons".to_string());
+        options.program_name = format!("{}/{}", bundle.trim_end_matches('/'), executable);
     }
 
     let trace = args.iter().any(|a| a == "--trace");
@@ -307,7 +348,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let frames: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(port) = serve_port {
-        serve::start(port, Arc::clone(&frames), Arc::clone(&logs))?;
+        let games = import::options_from(args).root.unwrap_or_else(ipa::default_root);
+        serve::start(port, Arc::clone(&frames), Arc::clone(&logs), games)?;
         println!("preview: http://0.0.0.0:{port}/  (open the port's preview URL)");
     }
 
