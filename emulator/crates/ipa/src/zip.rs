@@ -153,7 +153,9 @@ impl<'a> Zip<'a> {
         let eocd = find_eocd(data)?;
         let disk = u16_at(data, eocd + 4, "disk number")?;
         let cd_disk = u16_at(data, eocd + 6, "central directory disk")?;
-        if disk != 0 || cd_disk != 0 {
+        // 0xffff means "look in the ZIP64 end record", so it is not by itself a
+        // multi-disk archive; anything else that is not disk 0 is.
+        if disk != 0xffff && cd_disk != 0xffff && (disk != 0 || cd_disk != 0) {
             return Err(IpaError::Unsupported {
                 what: format!("multi-disk ZIP archives (this one spans disks {disk} and {cd_disk})"),
             });

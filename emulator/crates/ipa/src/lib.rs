@@ -192,7 +192,11 @@ pub fn import_bytes(data: &[u8], source_name: &str, options: &ImportOptions) -> 
         max_total_bytes: options.max_total_bytes,
         force_executable: vec![bundle.executable_name.clone()],
     };
-    let report = extract_app(&archive, &bundle.app_dir, &dir, &extract_options)?;
+    // The bundle keeps its own directory name, so what ends up on disk is an
+    // ordinary iOS app bundle: `<library>/<slug>/<App>.app/...`, which is what
+    // `simpsons-emu run <binary> --bundle <bundle dir>` wants.
+    let bundle_dir = dir.join(&bundle.app_name);
+    let report = extract_app(&archive, &bundle.app_dir, &bundle_dir, &extract_options)?;
     let manifest = manifest_for(&bundle, source_name, data.len() as u64, &report);
     manifest.write(&dir)?;
     Ok(ImportReport {

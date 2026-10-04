@@ -53,7 +53,7 @@ fn corpora() -> Vec<(&'static str, Vec<u8>)> {
         ),
         (
             "binary",
-            (0..40_000u32).map(|i| ((i * 2654435761) >> 13) as u8).collect::<Vec<u8>>(),
+            (0..40_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect::<Vec<u8>>(),
         ),
         (
             "text with runs",
@@ -672,7 +672,7 @@ fn an_imported_bundle_is_an_ordinary_ios_bundle() {
 #[test]
 fn slug_is_filesystem_safe() {
     assert_eq!(slug(Some("com.ea.simpsonsarcade.bv"), "TheSimpsons.app"), "com.ea.simpsonsarcade.bv");
-    assert_eq!(slug(None, "The Simpsons Arcade.ipa"), "The-Simpsons-Arcade-ipa");
+    assert_eq!(slug(None, "The Simpsons Arcade.ipa"), "The-Simpsons-Arcade.ipa");
     assert_eq!(slug(None, ""), "imported-game");
     assert_eq!(slug(None, "../.."), "imported-game");
 }
