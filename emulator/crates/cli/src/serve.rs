@@ -283,7 +283,10 @@ fn import(data: &[u8], name: &str, games: &Path) -> (u16, String, String) {
             ),
         );
     }
-    let options = ipa::ImportOptions { root: Some(games.to_path_buf()), ..Default::default() };
+    // Reusing an existing import is the friendly behaviour for a button: the
+    // panel reports `reused: true` rather than failing.  The CLI keeps the
+    // stricter "refuse unless --force" rule, where overwriting is a surprise.
+    let options = ipa::ImportOptions { root: Some(games.to_path_buf()), reuse: true, ..Default::default() };
     match ipa::import_bytes(data, name, &options) {
         Ok(report) => {
             let mut payload = String::new();
