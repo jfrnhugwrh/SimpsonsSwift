@@ -284,12 +284,33 @@ fn sign_extend<B: Bus>(cpu: &mut Cpu, insn: u32, pc: u32) -> Option<Outcome> {
     }
     let kind = (insn >> 20) & 0xf;
     let signed = match kind {
+        0b0110 => true,  // SXTB16
         0b1010 => true,  // SXTB
         0b1011 => true,  // SXTH
+        0b1100 => false, // UXTB16
         0b1110 => false, // UXTB
         0b1111 => false, // UXTH
         _ => return None,
     };
+    // The two "16" forms sign/zero extend bytes 0 and 2 of the rotated value.
+    if matches!(kind, 0b0110 | 0b1100) {
+        let rd = ((insn >> 12) & 0xf) as usize;
+        let rotate = ((insn >> 10) & 0x3) * 8;
+        let rotated = cpu.read_reg((insn & 0xf) as usize).rotate_right(rotate);
+        let low = if signed {
+            (rotated as u8 as i8 as i32 as u32) & 0xffff
+        } else {
+            rotated & 0xff
+        };
+        let high_byte = (rotated >> 16) & 0xff;
+        let high = if signed {
+            ((high_byte as i8 as i32 as u32) & 0xffff) << 16
+        } else {
+            high_byte << 16
+        };
+        cpu.write_reg(rd, low | high);
+        return Some(Outcome::Continue);
+    }
     let halfword = matches!(kind, 0b1011 | 0b1111);
     let rd = ((insn >> 12) & 0xf) as usize;
     let rm = (insn & 0xf) as usize;
@@ -321,6 +342,7 @@ fn byte_reverse<B: Bus>(cpu: &mut Cpu, insn: u32, pc: u32) -> Option<Outcome> {
     let rd = ((insn >> 12) & 0xf) as usize;
     let value = cpu.read_reg((insn & 0xf) as usize);
     let result = match (kind, field) {
+        (0b1111, 0b0011) => value.reverse_bits(),                     // RBIT
         (0b1011, 0b0011) => value.swap_bytes(),                       // REV
         (0b1011 | 0b1111, 0b1011) => {
             // REV16 (REVSH is the same swap, then the low half is sign extended)
@@ -348,10 +370,12 @@ fn saturate<B: Bus>(cpu: &mut Cpu, insn: u32, pc: u32) -> Option<Outcome> {
         0x6e => true,  // USAT / USAT16
         _ => return None,
     };
-    let doubleword = insn & 0xf0 == 0x30;
-    if !doubleword && insn & 0xf0 != 0x10 {
-        return None;
-    }
+    // Bit 5 selects the 16-bit form, bit 6 the shift type (0 = LSL, 1 = ASR),
+    // and bits 11:7 hold the shift amount -- bit 7 is the low bit of that field,
+    // not part of the opcode.  (`ssat r0, #8, r1` = 0xe6a70011,
+    // `ssat ... asr #5` = 0xe6a702d1, `usat ... lsl #5` = 0xe6e80291,
+    // `ssat16` = 0xe6a70f31.)
+    let doubleword = insn & 0x20 != 0;
     let sat_imm = (insn >> 16) & 0x1f;
     let rd = ((insn >> 12) & 0xf) as usize;
     let rm = (insn & 0xf) as usize;
@@ -366,7 +390,7 @@ fn saturate<B: Bus>(cpu: &mut Cpu, insn: u32, pc: u32) -> Option<Outcome> {
         return Some(Outcome::Continue);
     }
     let shift = ((insn >> 7) & 0x1f) as u32;
-    let arithmetic = insn & (1 << 6) != 0;
+    let arithmetic = insn & 0x40 != 0;
     let operand = if arithmetic {
         ((value as i32) >> shift) as u32
     } else {
@@ -392,7 +416,7 @@ fn cpu_sat_half(cpu: &mut Cpu, value: i32, sat_imm: u32, unsigned: bool) -> u32 
 }
 
 /// `SignedSat(value, bits)`: the range [-2^(bits-1), 2^(bits-1) - 1].
-fn saturate_signed(cpu: &mut Cpu, value: i32, bits: u32) -> u32 {
+pub(crate) fn saturate_signed(cpu: &mut Cpu, value: i32, bits: u32) -> u32 {
     if bits >= 32 {
         return value as u32;
     }
@@ -410,7 +434,7 @@ fn saturate_signed(cpu: &mut Cpu, value: i32, bits: u32) -> u32 {
 }
 
 /// `UnsignedSat(value, bits)`: the range [0, 2^bits - 1].
-fn saturate_unsigned(cpu: &mut Cpu, value: i32, bits: u32) -> u32 {
+pub(crate) fn saturate_unsigned(cpu: &mut Cpu, value: i32, bits: u32) -> u32 {
     let max = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
     if value < 0 {
         cpu.set_flag(FLAG_Q, true);
@@ -445,6 +469,206 @@ fn select_bytes<B: Bus>(cpu: &mut Cpu, insn: u32, pc: u32) -> Option<Outcome> {
     Some(Outcome::Continue)
 }
 
+
+/// The bitfield instructions: `SBFX` (0xe7a92153), `UBFX` (0xe7e70251) and
+/// `BFI`/`BFC` (0xe7cb0211 / 0xe7cb021f).  Width/msb live in bits 20:16, Rd in
+/// bits 15:12, the lsb in bits 11:7 and Rn in bits 3:0.
+fn bitfield<B: Bus>(cpu: &mut Cpu, insn: u32, pc: u32) -> Option<Outcome> {
+    // Bits 27:20 (six of them): 0x3e UBFX, 0x3a SBFX, 0x3c BFI/BFC.
+    let op = ((insn >> 20) & 0x3f) as u8;
+    let (kind, width_or_msb) = match op {
+        0x3e => (0u8, (insn >> 16) & 0x1f), // UBFX
+        0x3a => (1, (insn >> 16) & 0x1f),   // SBFX
+        0x3c => (2, (insn >> 16) & 0x1f),   // BFI / BFC
+        _ => return None,
+    };
+    // Bits 6:4 carry the 101 of UBFX/SBFX or the 001 of BFI/BFC; the lsb is
+    // bits 11:7 and shares bit 7 with that field.
+    let expected = if kind == 2 { 0x10 } else { 0x50 };
+    if insn & 0x70 != expected {
+        return None;
+    }
+    let rd = ((insn >> 12) & 0xf) as usize;
+    let lsb = (insn >> 7) & 0x1f;
+    let rn = (insn & 0xf) as usize;
+    let value = cpu.read_reg(rn);
+    match kind {
+        // UBFX / SBFX
+        0 | 1 => {
+            let width = width_or_msb + 1;
+            let extracted = if lsb == 0 { value } else { value >> lsb };
+            let result = if kind == 0 || width >= 32 {
+                if width >= 32 { extracted } else { extracted & (u32::MAX >> (32 - width)) }
+            } else {
+                let shift = 32 - width;
+                ((extracted << shift) as i32 >> shift) as u32
+            };
+            cpu.write_reg(rd, result);
+        }
+        // BFI / BFC
+        _ => {
+            if width_or_msb < lsb {
+                return None;
+            }
+            let width = width_or_msb - lsb + 1;
+            let mask = if width >= 32 { u32::MAX } else { ((1u64 << width) - 1) as u32 };
+            let source = if rn == 15 { 0 } else { value };
+            cpu.write_reg(rd, (cpu.read_reg(rd) & !(mask << lsb)) | ((source & mask) << lsb));
+        }
+    }
+    let _ = pc;
+    Some(Outcome::Continue)
+}
+
+/// The per-lane add/subtract of `SADD8`/`UADD8`/`SSUB16`/...: returns the
+/// packed result and the GE flags (one bit per lane).
+pub(crate) fn parallel_lanes(a: u32, b: u32, bytes: bool, subtract: bool, unsigned: bool) -> (u32, u32) {
+    let mut result = 0u32;
+    let mut ge = 0u32;
+    let lanes = if bytes { 4 } else { 2 };
+    for lane in 0..lanes {
+        let shift = lane * if bytes { 8 } else { 16 };
+        let mask = if bytes { 0xffu32 } else { 0xffffu32 };
+        let x = (a >> shift) & mask;
+        let y = (b >> shift) & mask;
+        let (value, flag) = if bytes {
+            if unsigned {
+                let sum = x + y;
+                let diff = x.wrapping_sub(y);
+                if subtract { (diff & 0xff, x >= y) } else { (sum & 0xff, sum > 0xff) }
+            } else {
+                let sx = (x as u8 as i8) as i32;
+                let sy = (y as u8 as i8) as i32;
+                if subtract {
+                    let d = sx - sy;
+                    (d as u8 as u32, d >= 0)
+                } else {
+                    let sum = sx + sy;
+                    (sum as u8 as u32, sum >= 0)
+                }
+            }
+        } else if unsigned {
+            let sum = x + y;
+            let diff = x.wrapping_sub(y);
+            if subtract { (diff & 0xffff, x >= y) } else { (sum & 0xffff, sum > 0xffff) }
+        } else {
+            let sx = (x as u16 as i16) as i32;
+            let sy = (y as u16 as i16) as i32;
+            if subtract {
+                let d = sx - sy;
+                (d as u16 as u32, d >= 0)
+            } else {
+                let sum = sx + sy;
+                (sum as u16 as u32, sum >= 0)
+            }
+        };
+        result |= value << shift;
+        if flag {
+            ge |= if bytes { 1 << lane } else { 0b11 << (lane * 2) };
+        }
+    }
+    (result, ge)
+}
+
+/// `PKHBT` (0xe6810412) / `PKHTB` (0xe6810452): pack the bottom half of Rn with
+/// the top (or bottom) half of a shifted Rm.
+fn pack_halfword<B: Bus>(cpu: &mut Cpu, insn: u32, pc: u32) -> Option<Outcome> {
+    if insn & 0x0ff0_0010 != 0x0680_0010 {
+        return None;
+    }
+    let top = insn & 0x40 == 0; // bit 6: 0 = PKHBT (LSL), 1 = PKHTB (ASR)
+    let rn = ((insn >> 16) & 0xf) as usize;
+    let rd = ((insn >> 12) & 0xf) as usize;
+    let amount = (insn >> 7) & 0x1f;
+    let rm = (insn & 0xf) as usize;
+    let first = cpu.read_reg(rn);
+    let second = cpu.read_reg(rm);
+    let result = if top {
+        (first & 0xffff) | ((second << amount) & 0xffff_0000)
+    } else {
+        (first & 0xffff_0000) | (((second as i32) >> amount) as u32 & 0xffff)
+    };
+    cpu.write_reg(rd, result);
+    let _ = pc;
+    Some(Outcome::Continue)
+}
+
+/// The parallel add/subtract family: `SADD8`/`SSUB8`/`SADD16`/... (0xe6110f92)
+/// and the unsigned `UADD8`/`USUB8`/... (0xe6510f92).  These set the GE flags,
+/// which `SEL` then reads.
+fn parallel_add_sub<B: Bus>(cpu: &mut Cpu, insn: u32, pc: u32) -> Option<Outcome> {
+    let op1 = (insn >> 20) & 0xff;
+    let unsigned = match op1 {
+        0x61 => false,
+        0x65 => true,
+        _ => return None,
+    };
+    let field = (insn >> 4) & 0xf;
+    // Bit 8 selects byte (1) or halfword (0) lanes; bits 7:4 the operation.
+    // 0x1 SADD16, 0x7 SSUB16, 0x9 SADD8, 0xf SSUB8 (and the same for the
+    // unsigned forms).
+    let bytes = field & 0x8 != 0;
+    let subtract = field & 0x4 != 0;
+    if !matches!(field & 0x3, 0x1 | 0x3) {
+        return None;
+    }
+    let rn = ((insn >> 16) & 0xf) as usize;
+    let rd = ((insn >> 12) & 0xf) as usize;
+    let rm = (insn & 0xf) as usize;
+    let a = cpu.read_reg(rn);
+    let b = cpu.read_reg(rm);
+    let (result, ge) = parallel_lanes(a, b, bytes, subtract, unsigned);
+    cpu.write_reg(rd, result);
+    // GE lives in CPSR bits 19:16.
+    cpu.cpsr = (cpu.cpsr & !0x000f_0000)
+        | ((ge & 0xf) << 16)
+        | if bytes { 0 } else { (ge & 0x3) << 18 };
+    let _ = pc;
+    Some(Outcome::Continue)
+}
+
+/// `USAD8`/`USADA8` (0xe780f211 / 0xe7803211) and `SMMLA` (0xe7503211), the
+/// sum-of-absolute-differences and high-multiply-accumulate instructions the
+/// compiler emits for `abs`/averaging idioms.
+fn dsp_multiply<B: Bus>(cpu: &mut Cpu, insn: u32, pc: u32) -> Option<Outcome> {
+    let op1 = (insn >> 20) & 0xff;
+    let rd = ((insn >> 16) & 0xf) as usize;
+    let ra = ((insn >> 12) & 0xf) as usize;
+    let rm = (insn & 0xf) as usize;
+    let rn = ((insn >> 8) & 0xf) as usize;
+    match op1 {
+        // SMMLA: the top half of the product, plus the accumulator.
+        0x75 => {
+            let product = (cpu.read_reg(rn) as i32 as i64) * (cpu.read_reg(rm) as i32 as i64);
+            let high = (product >> 32) as i32;
+            let result = if ra == 15 { high as u32 } else { high.wrapping_add(cpu.read_reg(ra) as i32) as u32 };
+            cpu.write_reg(rd, result);
+            Some(Outcome::Continue)
+        }
+        // USAD8 / USADA8
+        0x78 => {
+            let a = cpu.read_reg(rn);
+            let b = cpu.read_reg(rm);
+            let mut sum = 0u32;
+            for i in 0..4 {
+                let shift = i * 8;
+                let x = (a >> shift) & 0xff;
+                let y = (b >> shift) & 0xff;
+                sum += x.abs_diff(y);
+            }
+            if ra != 15 {
+                sum = sum.wrapping_add(cpu.read_reg(ra));
+            }
+            cpu.write_reg(rd, sum);
+            Some(Outcome::Continue)
+        }
+        _ => {
+            let _ = pc;
+            None
+        }
+    }
+}
+
 /// The media space (`op1 == 011`, bit 4 set).  Only the instructions an
 /// ARMv7 iOS binary actually uses are modelled; anything else is reported as
 /// undefined rather than mis-executed.
@@ -459,6 +683,18 @@ fn media<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: u32, pc: u32) -> Outcome {
         return outcome;
     }
     if let Some(outcome) = select_bytes::<B>(cpu, insn, pc) {
+        return outcome;
+    }
+    if let Some(outcome) = bitfield::<B>(cpu, insn, pc) {
+        return outcome;
+    }
+    if let Some(outcome) = pack_halfword::<B>(cpu, insn, pc) {
+        return outcome;
+    }
+    if let Some(outcome) = parallel_add_sub::<B>(cpu, insn, pc) {
+        return outcome;
+    }
+    if let Some(outcome) = dsp_multiply::<B>(cpu, insn, pc) {
         return outcome;
     }
     let _ = bus;

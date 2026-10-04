@@ -13,6 +13,7 @@
 //! same 32-bit word an ARM-mode encoding would use.
 
 use crate::vfp;
+use crate::arm::{parallel_lanes, saturate_signed, saturate_unsigned};
 use crate::{
     add_with_carry, shift_by, Access, Bus, Cpu, Outcome, Trap,
 };
@@ -653,45 +654,80 @@ fn execute_thumb2<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: u32, pc: u32) -> Out
     let hw1 = (insn >> 16) as u16;
     let hw2 = insn as u16;
 
-    // --- Branch and branch-with-link ------------------------------------
-    if hw1 & 0xf800 == 0xf000 && (hw2 & 0x8000 == 0 || hw2 & 0x4000 == 0) && hw2 & 0x1000 == 0 {
-        // 1111 0S imm10 / 11 J1 J2 imm11  (S != 0 for BL, cond==0xe for the
-        // conditional form)
-        let s = (hw1 >> 10) & 1;
-        let j1 = (hw2 >> 13) & 1;
-        let j2 = (hw2 >> 11) & 1;
-        let imm11 = hw2 & 0x7ff;
-        if hw1 & 0x1000 == 0 {
-            // Not the "conditional branch" pattern: B/BL with link bit S.
-            let link = insn & 0x4000_0000 != 0;
-            let i1 = !(j1 ^ s) & 1;
-            let i2 = !(j2 ^ s) & 1;
-            let imm32 = ((s as u32) << 24) | ((i1 as u32) << 23) | ((i2 as u32) << 22) | ((imm11 as u32) << 1);
-            let offset = ((imm32 as i32) << 7) >> 7;
+    // --- Branches, and the misc-control space that hides behind them ------
+    // In the `11110` space the second halfword's top bits select the group:
+    // 10 -> B (unconditional when bit 12 is set), 11 -> BL/BLX.  A
+    // "conditional branch" whose condition field is 1110 or 1111 is not a
+    // branch at all: that pattern is where DMB/DSB/ISB/CLREX/MRS/MSR live
+    // (`dmb sy` = 0xf3bf/0x8f5f, `mrs r0, cpsr` = 0xf3ef/0x8000).
+    if hw1 & 0xf800 == 0xf000 && hw2 & 0x8000 != 0 {
+        let cond = ((hw1 >> 6) & 0xf) as u32;
+        let link = hw2 & 0x4000 != 0;
+        if link || hw2 & 0x1000 != 0 {
+            // B (T4, bit 12 set) or BL (T1, bit 14 set)
+            let s_bit = (hw1 >> 10) & 1;
+            let j1 = (hw2 >> 13) & 1;
+            let j2 = (hw2 >> 11) & 1;
+            let i1 = !(j1 ^ s_bit) & 1;
+            let i2 = !(j2 ^ s_bit) & 1;
+            let imm11 = (hw2 & 0x7ff) as u32;
+            let imm32 = if link && hw2 & 0x1000 == 0 {
+                // BLX (immediate): imm10H in the first halfword, imm10L in the
+                // second one (`blx #0x1040` = 0xf001/0xe81e).
+                ((s_bit as u32) << 24)
+                    | ((i1 as u32) << 23)
+                    | ((i2 as u32) << 22)
+                    | (((hw1 & 0x3ff) as u32) << 12)
+                    | ((imm11 & 0x7fe) << 1)
+            } else {
+                ((s_bit as u32) << 24)
+                    | ((i1 as u32) << 23)
+                    | ((i2 as u32) << 22)
+                    | (imm11 << 1)
+            };
             if link {
                 cpu.r[14] = pc.wrapping_add(4) | 1;
             }
-            cpu.branch_to(pc.wrapping_add(4).wrapping_add(offset as u32));
+            let offset = ((imm32 as i32) << 7) >> 7;
+            if link && hw2 & 0x1000 == 0 {
+                // BLX switches to the ARM instruction set.
+                cpu.cpsr &= !crate::FLAG_T;
+                cpu.branch = Some(pc.wrapping_add(4).wrapping_add(offset as u32) & !3);
+            } else {
+                cpu.branch_keep_state(pc.wrapping_add(4).wrapping_add(offset as u32));
+            }
             return Outcome::Continue;
         }
-    }
-    // Conditional branch (T3): 1111 0S cond imm6 / 10 J1 0 J2 imm11
-    if hw1 & 0xf800 == 0xf000 && hw2 & 0x1000 != 0 && hw2 & 0x8000 == 0 {
-        let cond = ((hw1 >> 6) & 0xf) as u32;
-        let s = (hw1 >> 10) & 1;
-        let j1 = (hw2 >> 13) & 1;
-        let j2 = (hw2 >> 11) & 1;
-        let imm6 = (hw1 & 0x3f) as u32;
-        let imm11 = (hw2 & 0x7ff) as u32;
-        let imm32 = ((s as u32) << 20) | ((j2 as u32) << 19) | ((j1 as u32) << 18) | (imm6 << 12) | (imm11 << 1);
-        let offset = ((imm32 as i32) << 11) >> 11;
-        if cpu.cond_holds(cond) {
-            cpu.branch_to(pc.wrapping_add(4).wrapping_add(offset as u32));
+        if cond != 0b1110 && cond != 0b1111 {
+            // Conditional branch (T3).
+            let s_bit = (hw1 >> 10) & 1;
+            let j1 = (hw2 >> 13) & 1;
+            let j2 = (hw2 >> 11) & 1;
+            let imm6 = (hw1 & 0x3f) as u32;
+            let imm11 = (hw2 & 0x7ff) as u32;
+            let imm32 = ((s_bit as u32) << 20)
+                | ((j2 as u32) << 19)
+                | ((j1 as u32) << 18)
+                | (imm6 << 12)
+                | (imm11 << 1);
+            let offset = ((imm32 as i32) << 11) >> 11;
+            if cpu.cond_holds(cond) {
+                cpu.branch_keep_state(pc.wrapping_add(4).wrapping_add(offset as u32));
+            }
+            return Outcome::Continue;
         }
-        return Outcome::Continue;
+        return misc_control(cpu, insn, hw1, hw2, pc);
     }
 
-    // --- Data processing (modified immediate) ---------------------------
+    // --- Data processing (plain binary immediate) ------------------------
+    // `11110 i 1 0 op Rn 0 imm3 Rd imm8`: MOVW/MOVT, ADDW/SUBW, the
+    // saturating adds and the bitfield instructions.  Bit 9 must be set;
+    // otherwise the encoding is the modified-immediate space below.
+    if hw1 & 0xf800 == 0xf000 && hw2 & 0x8000 == 0 && hw1 & 0x0200 != 0 {
+        return plain_immediate(cpu, insn, hw1, hw2, pc);
+    }
+
+    // --- Data processing (modified immediate) ---------------------------    // --- Data processing (modified immediate) ---------------------------
     // 1111 0 i 0 op(4) S Rn / 0 imm3 Rd imm8
     if hw1 & 0xf800 == 0xf000 && hw2 & 0x8000 == 0 {
         let op = (hw1 >> 5) & 0xf;
@@ -702,9 +738,64 @@ fn execute_thumb2<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: u32, pc: u32) -> Out
         return data_processing_imm(cpu, pc, insn, op as u32, set_flags, rn, rd, imm);
     }
 
+    // --- Extend, byte reverse, count leading zeros -----------------------
+    // `1111 1010 ...` with the second halfword's top nibble 1111; the plain
+    // load/store space shares `hw1 & 0xf800 == 0xf800`, so the second halfword
+    // must be checked too.
+    if hw1 & 0xff00 == 0xfa00 && hw2 & 0xf000 == 0xf000 {
+        // The parallel add/subtract and SEL instructions share this space and
+        // are told apart by the low nibbles of the second halfword: 0..7 for
+        // the lane operations, 8..b for the extend/reverse/CLZ group.
+        let op1 = (hw1 >> 4) & 0xf;
+        let lane_op = match op1 {
+            0x8 | 0x9 | 0xc | 0xd => hw2 & 0xf0 <= 0x70,
+            0xa => hw2 & 0xf0 == 0x80, // SEL
+            _ => false,
+        };
+        if lane_op {
+            return thumb2_parallel(cpu, insn, hw1, hw2, pc);
+        }
+        return thumb2_extend(cpu, insn, hw1, hw2, pc);
+    }
+
     // --- Load/store single data item ------------------------------------
     if hw1 & 0xfe00 == 0xf800 {
         return load_store_thumb2(cpu, bus, insn, hw1, hw2, pc);
+    }
+
+    // --- Data processing (register) -------------------------------------
+    // 1110 1010 op(4) S Rn / 0 imm3 Rd imm2 type Rm
+    if hw1 & 0xfe00 == 0xea00 {
+        let op = (hw1 >> 5) & 0xf;
+        let set_flags = hw1 & 0x10 != 0;
+        let rn = (hw1 & 0xf) as usize;
+        let rd = ((hw2 >> 8) & 0xf) as usize;
+        let imm3 = ((hw2 >> 12) & 0x7) as u32;
+        let imm2 = ((hw2 >> 6) & 0x3) as u32;
+        let kind = ((hw2 >> 4) & 0x3) as u32;
+        let rm = (hw2 & 0xf) as usize;
+        let (operand, shifter_carry) = if kind == 0 && imm3 == 0 && imm2 == 0 {
+            (cpu.read_reg(rm), cpu.flag(crate::FLAG_C))
+        } else {
+            shift_by(kind, cpu.read_reg(rm), (imm3 << 2) | imm2, cpu.flag(crate::FLAG_C))
+        };
+        return data_processing_register(cpu, pc, insn, op as u32, set_flags, rn, rd, operand, shifter_carry);
+    }
+
+    // --- Shift by register / extend / byte reversal (1111 1010) ---------
+    if hw1 & 0xff00 == 0xfa00 {
+        return thumb2_shift_extend(cpu, pc, insn, hw1, hw2);
+    }
+
+    // --- Load/store multiple, dual, exclusive ---------------------------
+    // 1110 100x ... block/dual/exclusive
+    if hw1 & 0xfe00 == 0xe800 {
+        return thumb2_block_and_exclusive(cpu, bus, insn, hw1, hw2, pc);
+    }
+
+    // --- Multiply / multiply-accumulate (1111 1011) ---------------------
+    if hw1 & 0xff00 == 0xfb00 {
+        return thumb2_multiply(cpu, pc, insn, hw1, hw2);
     }
 
     // --- Data processing (register) -------------------------------------
@@ -820,22 +911,21 @@ fn data_processing_imm(
         0xe => crate::sub_with_carry(imm, operand1, true),       // RSB
         _ => return Outcome::Trap(Trap::Undefined { address: _pc, insn: _insn, thumb: true }),
     };
+    // With S = 1 and Rd = 1111 these encodings are the comparison forms
+    // (TST/TEQ/CMN/CMP) and only update the flags -- they must not be mistaken
+    // for a computed branch, which is what S = 0 with Rd = 1111 means.
+    if rd == 15 && set_flags {
+        cpu.set_nzcv(result, carry, overflow);
+        return Outcome::Continue;
+    }
     if rd == 15 {
-        if set_flags {
-            cpu.cpsr = (cpu.cpsr & !0xf800_0000) | (cpu.spsr & 0xf800_0000);
-        }
         cpu.branch_keep_state(result);
         return Outcome::Continue;
     }
-    if rd == 15 || (set_flags && rd == 0xf) {
-        // CMP/CMN/TST/TEQ with Rd == 1111 only update flags.
+    if set_flags {
+        cpu.set_nzcv(result, carry, overflow);
     }
-    if rd != 15 {
-        if set_flags {
-            cpu.set_nzcv(result, carry, overflow);
-        }
-        cpu.write_reg(rd, result);
-    }
+    cpu.write_reg(rd, result);
     Outcome::Continue
 }
 
@@ -975,6 +1065,249 @@ fn thumb2_shift_extend(cpu: &mut Cpu, _pc: u32, insn: u32, hw1: u16, hw2: u16) -
         0xa => Outcome::Continue, // SEL etc. (unused by the game)
         _ => Outcome::Trap(Trap::Undefined { address: _pc, insn, thumb: true }),
     }
+}
+
+
+/// The misc-control space: `11110 0 1110`/`1111` encodings, where the usual
+/// "conditional branch" slot would have an impossible condition.
+fn misc_control(cpu: &mut Cpu, insn: u32, hw1: u16, hw2: u16, pc: u32) -> Outcome {
+    let op = (hw1 >> 4) & 0xff;
+    let rn = (hw1 & 0xf) as usize;
+    let rd = ((hw2 >> 8) & 0xf) as usize;
+    match (op, hw2 & 0xff00) {
+        // DMB/DSB/ISB: memory barriers are no-ops in a single-threaded
+        // emulator.  `dmb sy` = 0xf3bf/0x8f5f, `dsb` 0x8f4f, `isb` 0x8f6f.
+        (0x3b, 0x8f00) => match hw2 & 0xf0 {
+            0x40 | 0x50 | 0x60 => Outcome::Continue,
+            // CLREX: 0xf3bf/0x8f2f.
+            0x20 => {
+                cpu.exclusive = None;
+                Outcome::Continue
+            }
+            _ => Outcome::Continue,
+        },
+        // MRS Rd, <spec_reg> (0xf3ef/0x8n00)
+        (0x3e, _) => {
+            // In User mode the condition flags and the mode bits are readable
+            // but the T bit is not (QEMU returns the same view).
+            let value = match (hw2 >> 8) & 0xf {
+                0 => cpu.cpsr & !crate::FLAG_T,
+                _ => 0,
+            };
+            if rd == 15 {
+                cpu.cpsr = (cpu.cpsr & 0x0fff_ffff) | (value & 0xf000_0000);
+            } else {
+                cpu.write_reg(rd, value);
+            }
+            Outcome::Continue
+        }
+        // MSR <spec_reg>, Rn (0xf380..0xf38f with the mask in hw2<11:8>)
+        (0x38, _) => {
+            let value = cpu.read_reg(rn);
+            let mask = (hw2 >> 8) & 0xf;
+            if mask & 0b1000 != 0 {
+                // The flags field.
+                cpu.cpsr = (cpu.cpsr & 0x0fff_ffff) | (value & 0xf000_0000);
+            }
+            Outcome::Continue
+        }
+        _ => Outcome::Trap(Trap::Undefined { address: pc, insn, thumb: true }),
+    }
+}
+
+
+/// The Thumb-2 parallel add/subtract and `SEL`: `uadd8 r0, r1, r2` =
+/// 0xfa81/0xf042, `sadd16` = 0xfa91/0xf002, `sel` = 0xfaa1/0xf082.  The
+/// registers are Rd = hw2<11:8>, Rn = hw1<3:0> and Rm = hw2<3:0>; bit 6 of the
+/// second halfword selects the unsigned forms.
+fn thumb2_parallel(cpu: &mut Cpu, insn: u32, hw1: u16, hw2: u16, pc: u32) -> Outcome {
+    let op1 = (hw1 >> 4) & 0xf;
+    let rn = (hw1 & 0xf) as usize;
+    let rd = ((hw2 >> 8) & 0xf) as usize;
+    let rm = (hw2 & 0xf) as usize;
+    let a = cpu.read_reg(rn);
+    let b = cpu.read_reg(rm);
+    match op1 {
+        // SEL Rd, Rn, Rm
+        0xa => {
+            let ge = (cpu.cpsr >> 16) & 0xf;
+            let mut result = 0u32;
+            for byte in 0..4 {
+                let shift = byte * 8;
+                let pick_a = ge & (1 << byte) != 0;
+                let value = if pick_a { (a >> shift) & 0xff } else { (b >> shift) & 0xff };
+                result |= value << shift;
+            }
+            cpu.write_reg(rd, result);
+            Outcome::Continue
+        }
+        // SADD8 / SADD16 / SSUB8 / SSUB16 (bits 7:4 = 8..d, bit 4 = subtract
+        // for the 0xc/0xd forms)
+        0x8 | 0x9 | 0xc | 0xd => {
+            let bytes = op1 & 0x1 == 0;
+            let subtract = op1 & 0x4 != 0;
+            let unsigned = hw2 & 0x40 != 0;
+            let (result, ge) = parallel_lanes(a, b, bytes, subtract, unsigned);
+            cpu.write_reg(rd, result);
+            cpu.cpsr = (cpu.cpsr & !0x000f_0000) | ((ge & 0xf) << 16);
+            Outcome::Continue
+        }
+        _ => Outcome::Trap(Trap::Undefined { address: pc, insn, thumb: true }),
+    }
+}
+
+/// Data processing (plain binary immediate): `11110 i 1 0 op(5) Rn 0 imm3 Rd
+/// imm8`, with `op` in the first halfword's bits 8:4.  Verified against
+/// Keystone: `movw r0, #0x1234` = 0xf241/0x2034, `movt` = 0xf2c5/0x6078,
+/// `addw r2, r3, #0x40` = 0xf203/0x0240, `ssat r0, #8, r1` = 0xf301/0x0007,
+/// `ubfx r0, r1, #4, #8` = 0xf3c1/0x1007 and `bfi r0, r1, #4, #8` =
+/// 0xf361/0x100b.
+fn plain_immediate(cpu: &mut Cpu, insn: u32, hw1: u16, hw2: u16, pc: u32) -> Outcome {
+    let op = (hw1 >> 4) & 0x1f;
+    let i = (hw1 >> 10) & 1;
+    let imm4 = (hw1 & 0xf) as u32;
+    let rn = (hw1 & 0xf) as usize;
+    let rd = ((hw2 >> 8) & 0xf) as usize;
+    let imm3 = ((hw2 >> 12) & 0x7) as u32;
+    let imm8 = (hw2 & 0xff) as u32;
+    let imm2 = ((hw2 >> 6) & 0x3) as u32;
+    let imm12 = ((i as u32) << 11) | (imm3 << 8) | imm8;
+    let imm16 = ((i as u32) << 15) | (imm4 << 12) | (imm3 << 8) | imm8;
+    match op {
+        // ADDW / SUBW
+        0b00000 | 0b01010 => {
+            let lhs = cpu.read_reg(rn);
+            let subtract = op == 0b01010;
+            let result = if subtract { lhs.wrapping_sub(imm12) } else { lhs.wrapping_add(imm12) };
+            cpu.write_reg(rd, result);
+            Outcome::Continue
+        }
+        // MOVW / MOVT
+        0b00100 | 0b01100 => {
+            let value = if op == 0b00100 {
+                imm16
+            } else {
+                (cpu.read_reg(rd) & 0xffff) | (imm16 << 16)
+            };
+            cpu.write_reg(rd, value);
+            Outcome::Continue
+        }
+        // SSAT / USAT / SSAT16 / USAT16, with an optional shift
+        0b10000 | 0b10010 | 0b11000 | 0b11010 => {
+            let unsigned = op & 0b01000 != 0;
+            let shifted = op & 0b00010 != 0;
+            let sat_imm = (hw2 & 0x1f) as u32;
+            let value = cpu.read_reg(rn);
+            // The 16-bit forms have no shift and saturate each halfword; they
+            // are the "shifted" encodings with a zero shift field.
+            if shifted && imm3 == 0 && imm2 == 0 {
+                let low = if unsigned {
+                    saturate_unsigned(cpu, value as u16 as i16 as i32, sat_imm)
+                } else {
+                    saturate_signed(cpu, value as u16 as i16 as i32, sat_imm + 1)
+                };
+                let high = if unsigned {
+                    saturate_unsigned(cpu, (value >> 16) as u16 as i16 as i32, sat_imm)
+                } else {
+                    saturate_signed(cpu, (value >> 16) as u16 as i16 as i32, sat_imm + 1)
+                };
+                cpu.write_reg(rd, (high << 16) | (low & 0xffff));
+                return Outcome::Continue;
+            }
+            // The shift amount is imm3:imm2 in the second halfword for both
+            // forms (`usat r0, #8, r1, lsl #5` = 0xf381/0x1048).
+            let amount = (imm3 << 2) | imm2;
+            let operand = if shifted {
+                ((value as i32) >> amount) as u32
+            } else {
+                value << amount
+            };
+            let result = if unsigned {
+                saturate_unsigned(cpu, operand as i32, sat_imm)
+            } else {
+                saturate_signed(cpu, operand as i32, sat_imm + 1)
+            };
+            cpu.write_reg(rd, result);
+            Outcome::Continue
+        }
+        // SBFX / UBFX
+        0b10100 | 0b11100 => {
+            let width = (hw2 & 0x1f) as u32 + 1;
+            let lsb = (imm3 << 2) | imm2;
+            let unsigned = op & 0b01000 != 0;
+            let value = cpu.read_reg(rn) >> lsb;
+            let result = if unsigned || width >= 32 {
+                value & (u32::MAX >> (32 - width.min(32)))
+            } else {
+                let shift = 32 - width;
+                ((value << shift) as i32 >> shift) as u32
+            };
+            cpu.write_reg(rd, result);
+            Outcome::Continue
+        }
+        // BFI / BFC
+        0b10110 => {
+            let msb = (hw2 & 0x1f) as u32;
+            let lsb = (imm3 << 2) | imm2;
+            if msb < lsb {
+                return Outcome::Trap(Trap::Undefined { address: pc, insn, thumb: true });
+            }
+            let width = msb - lsb + 1;
+            let mask = if width >= 32 { u32::MAX } else { ((1u64 << width) - 1) as u32 };
+            let source = if rn == 15 { 0 } else { cpu.read_reg(rn) };
+            let value = (cpu.read_reg(rd) & !(mask << lsb)) | ((source & mask) << lsb);
+            cpu.write_reg(rd, value);
+            Outcome::Continue
+        }
+        _ => Outcome::Trap(Trap::Undefined { address: pc, insn, thumb: true }),
+    }
+}
+
+/// Extend, byte-reverse and count-leading-zeros: `1111 1010 op1 ... 1111 op2
+/// Rm`, e.g. `uxtb.w r0, r1` = 0xfa5f/0xf081, `rev.w` = 0xfa91/0xf081,
+/// `rbit` = 0xfa91/0xf0a1 and `clz` = 0xfab1/0xf081.
+fn thumb2_extend(cpu: &mut Cpu, insn: u32, hw1: u16, hw2: u16, pc: u32) -> Outcome {
+    let op1 = (hw1 >> 4) & 0xf;
+    let op2 = (hw2 >> 4) & 0xf;
+    let rm = (hw2 & 0xf) as usize;
+    let rd = ((hw2 >> 8) & 0xf) as usize;
+    let value = cpu.read_reg(rm);
+    let result = match (op1, op2) {
+        // SXTH / UXTH / SXTB16 / UXTB16 / SXTB / UXTB with a rotate amount
+        (0x0..=0x5, 0x8) => {
+            let rotate = ((hw2 >> 4) & 0x3) as u32 * 8;
+            let rotated = value.rotate_right(rotate);
+            match op1 {
+                0x0 => (rotated as u16 as i16) as i32 as u32,        // SXTH
+                0x1 => rotated & 0xffff,                                // UXTH
+                0x2 => {
+                    // SXTB16: sign extend each halfword from 8 bits
+                    let low = rotated as u8 as i8 as i32 as u32 & 0xffff;
+                    let high = ((rotated >> 16) as u8 as i8 as i32 as u32 & 0xffff) << 16;
+                    low | high
+                }
+                0x3 => rotated & 0x00ff_00ff,                          // UXTB16
+                0x4 => (rotated as u8 as i8 as i32) as u32,             // SXTB
+                _ => rotated & 0xff,                                    // UXTB
+            }
+        }
+        // REV / REV16 / RBIT / REVSH
+        (0x9, op2) => match op2 {
+            0x8 => value.swap_bytes(),
+            0x9 => ((value & 0x00ff_00ff) << 8) | ((value >> 8) & 0x00ff_00ff),
+            0xa => value.reverse_bits(),
+            0xb => {
+                let swapped = ((value & 0x00ff_00ff) << 8) | ((value >> 8) & 0x00ff_00ff);
+                (swapped as u16 as i16 as i32) as u32
+            }
+            _ => return Outcome::Trap(Trap::Undefined { address: pc, insn, thumb: true }),
+        },
+        // CLZ
+        (0xb, 0x8) => value.leading_zeros(),
+        _ => return Outcome::Trap(Trap::Undefined { address: pc, insn, thumb: true }),
+    };
+    cpu.write_reg(rd, result);
+    Outcome::Continue
 }
 
 /// `1110 100x` group: load/store multiple, dual/exclusive accesses.
@@ -1119,80 +1452,147 @@ fn exclusive<B: Bus>(
 
 /// `1111 1011` group: multiplies, divides, and the multiply-with-accumulate
 /// forms used by C++ code.
-fn thumb2_multiply(cpu: &mut Cpu, _pc: u32, insn: u32, hw1: u16, hw2: u16) -> Outcome {
+fn thumb2_multiply(cpu: &mut Cpu, pc: u32, insn: u32, hw1: u16, hw2: u16) -> Outcome {
     let op1 = (hw1 >> 4) & 0xf;
     let op2 = (hw2 >> 4) & 0xf;
     let rn = (hw1 & 0xf) as usize;
     let rd = ((hw2 >> 8) & 0xf) as usize;
     let rm = (hw2 & 0xf) as usize;
+    let ra_field = (hw2 >> 12) & 0xf;
+    let ra = ra_field as usize;
+    // `Ra == 15` marks the non-accumulating form of the same opcode.
+    let accumulate = ra_field != 15;
+    let a = cpu.read_reg(rn);
+    let b = cpu.read_reg(rm);
+    let low_half = |v: u32| (v as u16 as i16) as i32;
+    let high_half = |v: u32| ((v >> 16) as u16 as i16) as i32;
+    let low_byte = |v: u32| (v as u8 as i8) as i32;
+    let high_byte = |v: u32| (((v >> 8) & 0xff) as u8 as i8) as i32;
+
     match (op1, op2) {
+        // MUL / MLA
         (0x0, 0x0) => {
-            // MLA / MUL: Rd = Rn*Rm + Ra (Ra in bits 15:12)
-            let ra = ((hw2 >> 12) & 0xf) as usize;
-            let mut result = cpu.read_reg(rn).wrapping_mul(cpu.read_reg(rm));
-            if ra != 15 {
+            let mut result = a.wrapping_mul(b);
+            if accumulate {
                 result = result.wrapping_add(cpu.read_reg(ra));
             }
             cpu.write_reg(rd, result);
-            Outcome::Continue
         }
+        // MLS
         (0x0, 0x1) => {
-            // MLS
-            let ra = ((hw2 >> 12) & 0xf) as usize;
-            let result = cpu.read_reg(ra).wrapping_sub(cpu.read_reg(rn).wrapping_mul(cpu.read_reg(rm)));
-            cpu.write_reg(rd, result);
-            Outcome::Continue
+            cpu.write_reg(rd, cpu.read_reg(ra).wrapping_sub(a.wrapping_mul(b)));
         }
-        (0x1, 0x0) => {
-            // SMULL/UMULL: hw1 bit 4 == 1 selects UMULL, ra unused
-            let rdlo = rd;
-            let rdhi = ((hw2 >> 12) & 0xf) as usize;
-            let unsigned = hw1 & 0x10 != 0;
-            let a = cpu.read_reg(rn);
-            let b = cpu.read_reg(rm);
-            let result: u64 = if unsigned {
-                (a as u64) * (b as u64)
+        // SMULxy / SMLAxy (op2 = x:y)
+        (0x1, 0x0..=0x3) => {
+            let product = low_half(a >> if op2 & 1 != 0 { 16 } else { 0 })
+                .wrapping_mul(low_half(b >> if op2 & 2 != 0 { 16 } else { 0 }));
+            let result = if accumulate {
+                product.wrapping_add(cpu.read_reg(ra) as i32) as u32
             } else {
-                ((a as i32 as i64) * (b as i32 as i64)) as u64
+                product as u32
             };
-            cpu.write_reg(rdlo, result as u32);
-            cpu.write_reg(rdhi, (result >> 32) as u32);
-            Outcome::Continue
+            cpu.write_reg(rd, result);
         }
-        (0x1, 0x2) => {
-            // SDIV / UDIV (armv7-R/M only; the emulator reports them)
-            Outcome::Trap(Trap::Undefined { address: 0, insn, thumb: true })
+        // SMUAD / SMLAD (op1 = 2) and SMUSD / SMLSD (op1 = 4): the two
+        // halfword products added or subtracted, optionally accumulating.  The
+        // "sd" forms differ only in the opcode, not in the arithmetic.
+        (0x2 | 0x4, 0x0 | 0x1) => {
+            let first = low_half(a).wrapping_mul(low_half(b));
+            let second = high_half(a).wrapping_mul(high_half(b));
+            let mut result = if op1 == 0x2 {
+                first.wrapping_add(second)
+            } else {
+                first.wrapping_sub(second)
+            };
+            if accumulate {
+                result = result.wrapping_add(cpu.read_reg(ra) as i32);
+            }
+            cpu.write_reg(rd, result as u32);
         }
-        (0x2, 0x2) => {
-            // SMULxy / SMLALxy style (SMUAD etc. share this space)
-            let ra = ((hw2 >> 12) & 0xf) as usize;
-            let _ = ra;
-            Outcome::Trap(Trap::Undefined { address: 0, insn, thumb: true })
-        }
-        (0x3, 0x0) => {
-            // SMULBB etc. (16x16), plus SMLABB when hw2 bit 15 == 0
-            let ra = ((hw2 >> 12) & 0xf) as usize;
-            let x = (insn >> 4) & 1;
-            let y = (insn >> 5) & 1;
-            let a = cpu.read_reg(rn);
-            let b = cpu.read_reg(rm);
-            let av = if x == 1 { (a as i16) as i32 } else { (a as i32) << 16 >> 16 };
-            let bv = if y == 1 { (b as i16) as i32 } else { (b as i32) << 16 >> 16 };
-            let product = av.wrapping_mul(bv);
-            let accumulate = ra != 15;
+        // SMULWx / SMLAWx: the top half of Rn times a half of Rm
+        (0x3, 0x0 | 0x1) => {
+            let product = high_half(a)
+                .wrapping_mul(low_half(b >> if op2 & 1 != 0 { 16 } else { 0 }));
             let result = if accumulate {
                 product.wrapping_add(cpu.read_reg(ra) as i32)
             } else {
                 product
             };
             cpu.write_reg(rd, result as u32);
-            if accumulate {
-                cpu.set_flag(crate::FLAG_Q, false);
-            }
-            Outcome::Continue
         }
-        _ => Outcome::Trap(Trap::Undefined { address: 0, insn, thumb: true }),
+        // SMMUL / SMMLA: the top half of the 32x32 product
+        (0x5, 0x0) => {
+            let product = (a as i32 as i64) * (b as i32 as i64);
+            let high = (product >> 32) as i32;
+            let result = if accumulate { high.wrapping_add(cpu.read_reg(ra) as i32) } else { high };
+            cpu.write_reg(rd, result as u32);
+        }
+        // USAD8 / USADA8
+        (0x7, 0x0) => {
+            let mut sum = 0u32;
+            for i in 0..4 {
+                let shift = i * 8;
+                sum += ((a >> shift) & 0xff).abs_diff((b >> shift) & 0xff);
+            }
+            if accumulate {
+                sum = sum.wrapping_add(cpu.read_reg(ra));
+            }
+            cpu.write_reg(rd, sum);
+        }
+        // SMULL / UMULL / SMLAL / UMLAL (Rl = hw2<15:12>, Rd = hw2<11:8>)
+        (0x8 | 0xa | 0xc | 0xe, 0x0) => {
+            let wide = op1 & 0x2 == 0;
+            let result: u64 = if wide {
+                ((a as i32 as i64) * (b as i32 as i64)) as u64
+            } else {
+                (a as u64) * (b as u64)
+            };
+            // The wide forms name RdLo in hw2<15:12> and RdHi in hw2<11:8>
+            // (`smull r1, r5, r2, r3` = 0xfb82/0x0103 leaves r1 = 0x200).
+            let rdlo = ((hw2 >> 12) & 0xf) as usize;
+            let rdhi = rd as usize;
+            if op1 & 0x4 != 0 {
+                // SMLAL / UMLAL accumulate into the RdHi:RdLo pair.
+                let accumulator = ((cpu.read_reg(rdhi) as u64) << 32) | cpu.read_reg(rdlo) as u64;
+                let sum = result.wrapping_add(accumulator);
+                cpu.write_reg(rdlo, sum as u32);
+                cpu.write_reg(rdhi, (sum >> 32) as u32);
+            } else {
+                cpu.write_reg(rdlo, result as u32);
+                cpu.write_reg(rdhi, (result >> 32) as u32);
+            }
+        }
+        // SMLALxy (op2 = 0b1000 | x:y)
+        (0xc, 0x8..=0xb) => {
+            // SMLALxy: RdLo in hw2<15:12>, RdHi in hw2<11:8>.
+            let rdlo = ((hw2 >> 12) & 0xf) as usize;
+            let rdhi = rd;
+            let x = op2 & 1;
+            let y = (op2 >> 1) & 1;
+            let product = if x != 0 { high_byte(a) } else { low_byte(a) } as i64
+                * if y != 0 { high_byte(b) } else { low_byte(b) } as i64;
+            let accumulator = ((cpu.read_reg(rdhi) as u64) << 32) | cpu.read_reg(rdlo) as u64;
+            let sum = (product as u64).wrapping_add(accumulator);
+            cpu.write_reg(rdlo, sum as u32);
+            cpu.write_reg(rdhi, (sum >> 32) as u32);
+        }
+        // SDIV / UDIV
+        (0x9 | 0xb, 0xf) => {
+            let divisor = b;
+            let quotient = if divisor == 0 {
+                0
+            } else if op1 == 0x9 {
+                ((a as i32).wrapping_div(divisor as i32)) as u32
+            } else {
+                a / divisor
+            };
+            cpu.write_reg(rd, quotient);
+        }
+        _ => {
+            return Outcome::Trap(Trap::Undefined { address: pc, insn, thumb: true });
+        }
     }
+    Outcome::Continue
 }
 
 /// Bitfield instructions: UBFX/SBFX/BFI/BFC, SSAT/USAT, and the 16-bit

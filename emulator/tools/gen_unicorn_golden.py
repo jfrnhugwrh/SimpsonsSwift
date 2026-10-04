@@ -134,6 +134,17 @@ def arm_cases():
     # --- branches (targets inside the mapped window) ----------------------
     for text in ["b #0x1020", "bl #0x1030", "bx r12", "blx r12", "bx lr"]:
         cases.append(("arm " + text, text, False))
+    # --- System / bitfield instructions an optimized iOS binary uses -------
+    for text in [
+        "dmb sy", "dsb sy", "isb sy", "clrex", "pld [r1]",
+        "ubfx r0, r1, #4, #8", "sbfx r2, r3, #2, #10", "bfi r0, r1, #4, #8",
+        "bfc r0, #4, #8", "ubfx r4, r5, #0, #16", "sbfx r4, r5, #0, #16",
+        "smmla r0, r1, r2, r3", "usad8 r0, r1, r2", "usada8 r0, r1, r2, r3",
+        "rbit r0, r1", "rev16 r0, r1", "pkhbt r0, r1, r2, lsl #8",
+        "ssat r0, #8, r1, asr #5", "usat r0, #8, r1, lsl #5", "sxtb16 r0, r1",
+        "usub8 r0, r1, r2", "uadd8 r0, r1, r2", "sel r0, r1, r2",
+    ]:
+        cases.append(("arm " + text, text, False))
     # --- VFP --------------------------------------------------------------
     for text in [
         "vadd.f32 s0, s1, s2", "vsub.f32 s3, s4, s5", "vmul.f32 s6, s1, s2",
@@ -193,6 +204,25 @@ def thumb_cases():
         "ldr r0, [pc, #8]", "ldr r0, [sp, #4]", "str r0, [sp, #8]",
         "add r0, sp, #16", "push {r0, r1, lr}", "pop {r0, r1, r3}",
         "ldmia r5!, {r0, r1}", "stmia r7!, {r0, r1}", "b #0x1020", "bx lr",
+        "movw r0, #0x1234", "movt r0, #0x5678", "add.w r2, r3, #0x40",
+        "sub.w r2, r3, #0x10", "cmp.w r0, #0x100", "lsl.w r0, r1, #4",
+        "mvn.w r0, r1", "eor.w r0, r1, r2", "tst.w r0, r1", "add.w r1, r2, r3, lsl #4",
+        "ubfx r0, r1, #4, #8", "sbfx r2, r3, #2, #10", "bfi r0, r1, #4, #8",
+        "bfc r0, #4, #8", "uxtb.w r0, r1", "sxtb.w r0, r1", "rev.w r0, r1",
+        "clz r0, r1", "dmb sy", "dsb sy", "isb sy", "clrex", "mrs r0, cpsr",
+        "ssat r0, #8, r1", "usat r0, #8, r1", "ssat16 r0, #8, r1", "usat16 r0, #8, r1",
+        "mul r1, r2, r3", "mla r1, r2, r3, r4", "mls r1, r2, r3, r4", "smulbb r1, r2, r3",
+        "smulbt r1, r2, r3", "smlabb r1, r2, r3, r4", "smulwb r1, r2, r3", "smlawb r1, r2, r3, r4",
+        "smull r1, r5, r2, r3", "umull r1, r5, r2, r3", "smlal r1, r5, r2, r3", "umlal r1, r5, r2, r3",
+        "smlalbb r1, r5, r2, r3", "smmul r1, r2, r3", "smmla r1, r2, r3, r4", "smuad r1, r2, r3",
+        "smlad r1, r2, r3, r4", "smusd r1, r2, r3", "sel r1, r2, r3",
+        "ssat r0, #8, r1, asr #5", "usat r0, #8, r1, lsl #5",
+        "sxtb16 r0, r1", "uxtb16 r0, r1", "pkhbt r0, r1, r2, lsl #8",
+        "pkhtb r0, r1, r2, asr #8", "rbit r0, r1", "uadd8 r0, r1, r2",
+        "usub8 r0, r1, r2", "sadd16 r0, r1, r2", "ssub16 r0, r1, r2",
+        "uadd16 r0, r1, r2", "usub16 r0, r1, r2", "smmla r0, r1, r2, r3",
+        "usad8 r0, r1, r2", "usada8 r0, r1, r2, r3", "addw r2, r3, #0x400",
+        "subw r2, r3, #0x400", "bl #0x1040", "blx #0x1040",
         "lsls r0, r1", "lsrs r0, r1",
     ]:
         cases.append(("thumb " + text, text, True))
@@ -354,6 +384,14 @@ def sequence_cases():
         ("it eq\n  strbeq r2, [r7, #1]", 2),
     ]:
         cases.append((text.replace("\n", "; "), [text], True, steps, True))
+    # The GE flags: `uadd8` sets one GE bit per byte and `sel` picks bytes from
+    # Rn or Rm according to them.
+    for texts in [
+        ["uadd8 r0, r1, r2", "sel r3, r1, r2"],
+        ["usub8 r0, r1, r2", "sel r3, r1, r2"],
+        ["sadd16 r0, r1, r2", "sel r3, r1, r2"],
+    ]:
+        cases.append(("; ".join(texts), texts, False, 2, False))
     # A conditional branch that must not be taken.
     for texts in [
         ["movs r0, #0", "bne #0x1080"],
