@@ -261,6 +261,9 @@ public class MainActivity extends Activity implements EmulatorSession.Listener {
         final int port = EmulatorSession.freePort();
         arguments.add("--serve");
         arguments.add(Integer.toString(port));
+        // The demo guest exits in milliseconds; without this the preview would
+        // be gone before it could be shown.
+        arguments.add("--keep-serving");
         // Loopback only: the preview never leaves the phone.
         arguments.add("--bind");
         arguments.add("127.0.0.1");
@@ -484,7 +487,14 @@ public class MainActivity extends Activity implements EmulatorSession.Listener {
         settings.setBuiltInZoomControls(true);
         settings.setDisplayZoomControls(false);
         webView.setBackgroundColor(0xFF10121A);
-        webView.setWebViewClient(new WebViewClient());
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (!"about:blank".equals(url)) {
+                    append("[app] preview page loaded: " + url);
+                }
+            }
+        });
     }
 
     private void showPreview(boolean preview) {

@@ -81,11 +81,14 @@ alive=no
 for _ in $(seq 1 45); do
     sleep 2
     adb logcat -d -s SimpsonsEmu:I > smoke/logcat.txt 2>&1
-    if grep -q "preview ready on 127.0.0.1" smoke/logcat.txt; then
+    if grep -q "preview page loaded" smoke/logcat.txt; then
         ready=yes
         break
     fi
 done
+# Give the WebView a moment to settle before the screenshot.
+sleep 3
+adb logcat -d -s SimpsonsEmu:I > smoke/logcat.txt 2>&1
 [ -n "$(adb shell pidof "$package" | tr -d '\r\n')" ] && alive=yes || alive=no
 
 adb logcat -d > smoke/logcat-full.txt 2>&1
@@ -95,7 +98,9 @@ echo "--- app log (logcat, tag SimpsonsEmu) ---"
 tail -40 smoke/logcat.txt
 
 check "the app launches and stays up" "$alive"
-check "the app runs the packaged binary and its preview answers" "$ready"
+grep -q "preview ready on 127.0.0.1" smoke/logcat.txt && served=yes || served=no
+check "the app execs the packaged binary and its preview server answers" "$served"
+check "the WebView renders the emulator's preview page" "$ready"
 grep -q "hello from the guest" smoke/logcat.txt && guest=yes || guest=no
 check "the guest's output reaches the app" "$guest"
 

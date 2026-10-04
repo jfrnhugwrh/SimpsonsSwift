@@ -57,6 +57,7 @@ RUN OPTIONS:
     --screenshot <file.bmp>   Write the last presented frame
     --serve <port>            Serve a live framebuffer preview on <port>
     --bind <addr>             Address the preview binds to (default 0.0.0.0)
+    --keep-serving            Keep the preview up after the guest stops
     --stats                   Print call statistics
 ";
 
@@ -449,6 +450,20 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             println!("\n--- bound imports ({} symbols) ---", machine.image.imports.len());
             for import in machine.image.imports.iter().take(40) {
                 println!("  {:<40} slot {:#010x} -> {:#010x}", import.symbol, import.slot, import.trampoline);
+            }
+        }
+    }
+
+    // The guest stopping does not have to take the preview with it: the last
+    // frame, the log and the import panel are worth more after the run than
+    // during it.  The Android app relies on this — a guest that exits in
+    // milliseconds would otherwise never show a preview at all.
+    if let Some(port) = serve_port {
+        if args.iter().any(|a| a == "--keep-serving") {
+            let host = flag(args, "--bind").unwrap_or("0.0.0.0");
+            println!("\npreview still serving on http://{host}:{port}/ — interrupt to stop");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
             }
         }
     }
