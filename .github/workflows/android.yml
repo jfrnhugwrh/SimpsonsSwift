@@ -17,6 +17,7 @@
 name: Android build
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       abis:
@@ -56,10 +57,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        abi: ${{ fromJSON(inputs.abis) }}
+        abi: ${{ fromJSON(inputs.abis || '["arm64-v8a", "armeabi-v7a", "x86_64", "x86"]') }}
     defaults:
       run:
         shell: bash
+    env:
+      # `inputs` is only populated by workflow_dispatch; the fallbacks keep the
+      # job runnable however it was started.
+      API_LEVEL: ${{ inputs.api_level || '21' }}
+      PROFILE: ${{ inputs.profile || 'release' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -132,16 +138,16 @@ jobs:
           mkdir -p "$HOME/.cargo"
           {
             echo "[target.$RUST_TARGET]"
-            echo "linker = \"$NDK_BIN/${NDK_TRIPLE}${{ inputs.api_level }}-clang\""
+            echo "linker = \"$NDK_BIN/${NDK_TRIPLE}$API_LEVEL-clang\""
           } >> "$HOME/.cargo/config.toml"
           cat "$HOME/.cargo/config.toml"
-          test -x "$NDK_BIN/${NDK_TRIPLE}${{ inputs.api_level }}-clang"
+          test -x "$NDK_BIN/${NDK_TRIPLE}$API_LEVEL-clang"
 
       - name: Build
         working-directory: emulator
         run: |
           set -euo pipefail
-          profile="${{ inputs.profile }}"
+          profile="$PROFILE"
           if [ "$profile" = release ]; then
             cargo build --release --target "$RUST_TARGET" --bin simpsons-emu
             out="target/$RUST_TARGET/release"
@@ -162,18 +168,18 @@ jobs:
           cp "$OUTPUT_DIR/simpsons-emu" "$stage/"
           # Strip the release binary the way a packaged app would; debug builds
           # keep their symbols.
-          if [ "${{ inputs.profile }}" = release ]; then
+          if [ "$PROFILE" = release ]; then
             "$NDK_BIN/llvm-strip" --strip-unneeded "$stage/simpsons-emu" || true
           fi
           {
             echo "abi:             $abi"
             echo "rust target:     $RUST_TARGET"
-            echo "api level:       ${{ inputs.api_level }}"
-            echo "profile:         ${{ inputs.profile }}"
+            echo "api level:       $API_LEVEL"
+            echo "profile:         $PROFILE"
             echo "rustc:           $(rustc --version)"
             echo "cargo:           $(cargo --version)"
             echo "ndk:             $ANDROID_NDK_HOME"
-            echo "clang:           $("$(ls -d "$NDK_BIN"/clang | head -1)" --version | head -1)"
+            echo "clang:           $("$NDK_BIN/clang" --version | head -1)"
             echo "commit:          $GITHUB_SHA"
             echo "built:           $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo
@@ -203,8 +209,8 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Rust target | \`$RUST_TARGET\` |"
-            echo "| API level | ${{ inputs.api_level }} |"
-            echo "| Profile | ${{ inputs.profile }} |"
+            echo "| API level | $API_LEVEL |"
+            echo "| Profile | $PROFILE |"
             echo "| NDK | \`$ANDROID_NDK_HOME\` |"
             echo "| Commit | \`$GITHUB_SHA\` |"
             echo

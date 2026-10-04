@@ -11,7 +11,8 @@ emulator/                      the emulator itself (std-only Rust workspace)
   crates/guestmem/             guest address space, permissions, regions
   crates/arm/                  ARM + Thumb/Thumb-2 + VFP interpreter
   crates/runtime/              loader, syscall layer, HLE for the iOS frameworks
-  crates/cli/                  `simpsons-emu info | dump | run`
+  crates/ipa/                  .ipa reader: ZIP, DEFLATE, plist, validation, import
+  crates/cli/                  `simpsons-emu import | games | info | dump | run`
 ```
 
 The C listing was used as the behavioural reference (symbol surface, syscall
@@ -29,6 +30,59 @@ cd emulator
 cargo test            # 334 differential instruction cases + crate tests
 cargo build --release # target/release/simpsons-emu
 ```
+
+## Importing the game
+
+**This repository contains no game.** No ROM, no binary and no asset is bundled,
+downloaded, distributed or hard-coded anywhere; the emulator is useless until you
+point it at a copy of *The Simpsons Arcade* (iOS, EA, 2009) that you obtained
+legally — the release this repository's decompilation came from is
+`The Simpsons Arcade v1.1.43.ipa`, bundle id `com.ea.simpsonsarcade.bv`.
+
+```sh
+simpsons-emu import "The Simpsons Arcade v1.1.43.ipa"   # validate + extract
+simpsons-emu games                                      # what is in the library
+simpsons-emu run "The Simpsons Arcade v1.1.43.ipa" --serve 8080
+```
+
+`import` reads the archive, checks it, and extracts the bundle into the game
+library — `$XDG_DATA_HOME/simpsons-emu/games/<bundle-id>/` by default
+(`$SIMPSONS_EMU_GAMES` or `--dest` overrides it).  The extracted bundle is an
+ordinary iOS app bundle, so the pre-existing entry point is all the emulator
+needs:
+
+```sh
+simpsons-emu run  ~/.local/share/simpsons-emu/games/com.ea.simpsonsarcade.bv/TheSimpsons.app/TheSimpsons \
+                  --bundle ~/.local/share/simpsons-emu/games/com.ea.simpsonsarcade.bv/TheSimpsons.app \
+                  --trace --serve 8080
+```
+
+`info`, `dump` and `run` also take the `.ipa` directly: it is imported on demand
+and reused from then on, so running the same archive twice does not re-extract
+it.  The browser preview served by `--serve` has an import panel too — pick the
+file, press *Import*, and the same validation runs server-side.
+
+What is checked before anything is written, each with its own error message:
+
+| check | what it catches |
+|---|---|
+| ZIP end-of-central-directory, central directory, CRC-32 per entry | a truncated or damaged download |
+| `Payload/<Name>.app/` with a readable `Info.plist` | a file that is not an iOS app package |
+| `CFBundleExecutable` exists and is a Mach-O | a repackaged or hollowed-out bundle |
+| the Mach-O has a 32-bit ARM slice | an arm64-only or simulator build (this emulator is ARMv7) |
+| `LC_ENCRYPTION_INFO` `cryptid == 0` | a FairPlay-encrypted App Store download, which no emulator can read |
+| bundle id / display name / version | some other iOS app, or a different version of this one |
+
+A valid IPA that is not this game is refused unless `--allow-other-app` is
+passed; a different *version* of this game imports with a warning, because the
+HLE surface is written against 1.1.43.  Extraction refuses `..` components,
+absolute paths and symlinks, and caps the entry count and total size.  Nothing
+is ever re-uploaded anywhere, and only the extracted bundle is kept — the `.ipa`
+itself is not copied into the library.
+
+The ZIP reader, the DEFLATE inflater and the XML/binary plist parser are part of
+`crates/ipa`: the workspace has no external dependencies, and `cargo build
+--offline` has to keep working.
 
 To run the real game binary (which is **not** in this repository, so this path
 is unverified end to end):
@@ -102,7 +156,9 @@ misc-control space being decoded as a branch).
 
 * **The game itself.** No game binary or ROM is present in this repository, so
   the end-to-end path (boot → render → playable) has never been executed. Every
-  claim above is about the emulator's components, not about the game.
+  claim above is about the emulator's components, not about the game. The import
+  path *is* tested end to end, but against a synthetic ARMv7 Mach-O packaged as
+  an `.ipa` — not against the real one, which nobody may redistribute.
 * **The HLE surface.** The syscall layer and the framework shims (libSystem,
   CoreFoundation, CoreGraphics, OpenGL ES, OpenAL, AudioToolbox, the Objective-C
   runtime) are written against the symbol list extracted from the Ghidra dump.
@@ -115,6 +171,42 @@ misc-control space being decoded as a branch).
 * **Rare encodings.** A handful of media instructions are left unimplemented on
   purpose rather than guessed (`SMLALD`/`SMLSLD`, `SMMLS`, the `x`-variants of the
   parallel add/subtract, `SMMULR`/`SMMLAR`, `VCVT` fixed-point, NEON).
+
+## Continuous integration
+
+Two workflows live in `.github/workflows/`:
+
+* **`tests.yml`** — builds and tests the workspace.  Triggered by pull requests
+  and by hand; *not* on every push.
+* **`android.yml`** — the Android build, `workflow_dispatch` only.  Run it from
+  the *Actions* tab: it cross-compiles `simpsons-emu` for `arm64-v8a`,
+  `armeabi-v7a`, `x86_64` and `x86` with the NDK the runner already ships (no SDK
+  or Gradle is downloaded), and attaches one artifact per ABI.  See
+  [Building for Android](#building-for-android).
+
+### Building for Android
+
+The repository's build system is cargo, so "the Android build" means
+cross-compiling the workspace for the Android targets; there is no Gradle project
+here to turn into an APK.  The workflow will produce one if an Android
+application project is ever added under `android/` — until then its `package`
+job says so explicitly rather than inventing an app.
+
+```sh
+cd emulator
+rustup target add aarch64-linux-android
+export NDK="$ANDROID_NDK_HOME"                       # or the NDK you installed
+export CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+cat >> ~/.cargo/config.toml <<EOF
+[target.aarch64-linux-android]
+linker = "$CC"
+EOF
+cargo build --release --target aarch64-linux-android --bin simpsons-emu
+```
+
+Each artifact also carries a `BUILD_INFO.txt` recording the rustc, NDK, API level
+and commit it was built from.  The game is not part of the artifact: import your
+own decrypted copy on the device with `simpsons-emu import`.
 
 ## Architecture notes
 
@@ -131,3 +223,9 @@ misc-control space being decoded as a branch).
 * **Interpreter.** Not a cycle-accurate model: the differential test pins down
   architecturally visible behaviour (including flags, `IT` state, GE bits and
   VFP registers), which is what a game can observe.
+* **IPA import.** An `.ipa` is a ZIP, so `crates/ipa` is a ZIP reader (central
+  directory, ZIP64, CRC-32), a raw DEFLATE decoder, a property-list reader for
+  both `Info.plist` dialects, the validation described above and the extraction
+  into the game library.  It is the only part of the workspace that touches a
+  file the user supplies, so every offset is range-checked and every entry is
+  checked for path escapes before it is written.
