@@ -155,7 +155,7 @@ impl Huffman {
         let mut code: i32 = 0;
         let mut first: i32 = 0;
         let mut index: i32 = 0;
-        for length in 1..15 {
+        for length in 1..=15 {
             code |= br.take(1)? as i32;
             let count = self.counts[length] as i32;
             if code - first < count {
