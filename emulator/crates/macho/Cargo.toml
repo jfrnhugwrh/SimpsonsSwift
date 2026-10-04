@@ -1,0 +1,12 @@
+[package]
+name = "macho"
+description = "32-bit Mach-O reader and loader support for ARMv7 iOS executables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lib]
+name = "macho"
+path = "src/lib.rs"

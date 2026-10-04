@@ -1,0 +1,16 @@
+[package]
+name = "cli"
+description = "Command line frontend for the Simpsons Arcade iOS emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+macho = { path = "../macho" }
+guestmem = { path = "../guestmem" }
+arm = { path = "../arm" }
+runtime = { path = "../runtime" }
+
+[[bin]]
+name = "simpsons-emu"
+path = "src/main.rs"

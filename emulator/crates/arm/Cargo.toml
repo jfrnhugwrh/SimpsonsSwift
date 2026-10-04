@@ -1,0 +1,13 @@
+[package]
+name = "arm"
+description = "ARMv7-A/Thumb-2 interpreter (with VFP) for the Simpsons Arcade iOS emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+guestmem = { path = "../guestmem" }
+
+[lib]
+name = "arm"
+path = "src/lib.rs"

@@ -1,0 +1,8 @@
+[package]
+name = "guestmem"
+description = "Guest physical address space with page permissions for the ARMv7 emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
