@@ -27,7 +27,7 @@ name: Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'arena/**']
     tags: ['v*']
     paths-ignore:
       - '**.md'
