@@ -13,6 +13,11 @@ permissions:
   contents: read
   pull-requests: write
 
+env:
+  # Plain logs: the tail is posted to the pull request, where ANSI escapes are
+  # noise.
+  CARGO_TERM_COLOR: never
+
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
@@ -38,20 +43,18 @@ jobs:
         id: build
         run: |
           set -uo pipefail
-          {
-            echo "== toolchain"
-            rustc --version
-            cargo --version
-            echo
-            echo "== cargo build --workspace --all-targets"
-            cargo build --workspace --all-targets
-            echo
-            echo "== cargo test --workspace"
-            cargo test --workspace
-            echo
-            echo "== cargo build --workspace --release"
-            cargo build --workspace --release
-          } 2>&1 | tee /tmp/ci.log
+          status=0
+          echo "== toolchain" | tee -a /tmp/ci.log
+          { rustc --version; cargo --version; } 2>&1 | tee -a /tmp/ci.log
+          # --keep-going so one broken crate does not hide the errors in the
+          # next one; every problem shows up in a single run.
+          echo "== cargo build --workspace --all-targets --keep-going" | tee -a /tmp/ci.log
+          cargo build --workspace --all-targets --keep-going 2>&1 | tee -a /tmp/ci.log || status=1
+          echo "== cargo test --workspace" | tee -a /tmp/ci.log
+          cargo test --workspace --keep-going 2>&1 | tee -a /tmp/ci.log || status=1
+          echo "== cargo build --workspace --release" | tee -a /tmp/ci.log
+          cargo build --workspace --release 2>&1 | tee -a /tmp/ci.log || status=1
+          exit $status
 
       # The log tail is posted to the pull request so a failure can be read
       # without opening the Actions log viewer.
@@ -66,7 +69,7 @@ jobs:
             echo "### \`cargo test\` — $OUTCOME"
             echo
             echo '```'
-            grep -E '^(test result|running|error|warning: unused|error\[)' /tmp/ci.log | tail -40
+            grep -E '^(test result|running|error|warning|error\[)' /tmp/ci.log | tail -60
             echo '```'
             if [ "$OUTCOME" != success ]; then
               echo

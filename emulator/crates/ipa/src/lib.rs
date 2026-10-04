@@ -228,8 +228,8 @@ pub fn find_game(root: &Path, needle: &str) -> Option<ImportedGame> {
     list(root).into_iter().find(|game| {
         let manifest = &game.manifest;
         game.dir.file_name().is_some_and(|name| name.eq_ignore_ascii_case(needle))
+            || game.label().eq_ignore_ascii_case(needle)
             || manifest.title.eq_ignore_ascii_case(needle)
-            || manifest.label().eq_ignore_ascii_case(needle)
             || manifest.app_bundle.eq_ignore_ascii_case(needle)
             || manifest.bundle_id.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(needle))
     })
