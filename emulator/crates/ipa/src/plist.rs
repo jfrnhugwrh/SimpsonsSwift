@@ -388,8 +388,8 @@ fn base64_decode(text: &str) -> Vec<u8> {
 
 struct Binary<'a> {
     data: &'a [u8],
+    /// Byte offset of every object, in object-number order.
     offsets: Vec<usize>,
-    object_size: usize,
     reference_size: usize,
     top: usize,
 }
@@ -426,7 +426,7 @@ impl<'a> Binary<'a> {
                 what: format!("binary plist top object {top} is out of range ({} objects)", offsets.len()),
             });
         }
-        Ok(Binary { data, offsets, object_size, reference_size, top })
+        Ok(Binary { data, offsets, reference_size, top })
     }
 
     fn top(&self) -> Result<Plist> {

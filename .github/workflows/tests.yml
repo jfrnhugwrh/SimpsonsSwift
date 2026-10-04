@@ -51,7 +51,7 @@ jobs:
           echo "== cargo build --workspace --all-targets --keep-going" | tee -a /tmp/ci.log
           cargo build --workspace --all-targets --keep-going 2>&1 | tee -a /tmp/ci.log || status=1
           echo "== cargo test --workspace" | tee -a /tmp/ci.log
-          cargo test --workspace --keep-going 2>&1 | tee -a /tmp/ci.log || status=1
+          cargo test --workspace --no-fail-fast 2>&1 | tee -a /tmp/ci.log || status=1
           echo "== cargo build --workspace --release" | tee -a /tmp/ci.log
           cargo build --workspace --release 2>&1 | tee -a /tmp/ci.log || status=1
           exit $status

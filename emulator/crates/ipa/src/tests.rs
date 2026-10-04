@@ -414,7 +414,7 @@ fn inspection_refuses_an_arm64_only_build() {
     let archive = build_ipa(&FakeIpa { arm64_only: true, ..Default::default() });
     let error = inspect_bytes(&archive, None).unwrap_err();
     match error {
-        IpaError::NoArmSlice { architectures, .. } => assert_eq!(architectures, vec!["arm64"]),
+        IpaError::NoArmSlice { ref architectures, .. } => assert_eq!(architectures, &vec!["arm64".to_string()]),
         other => panic!("expected NoArmSlice, got {other}"),
     }
     assert!(error.to_string().contains("ARMv7"), "{error}");
@@ -543,9 +543,9 @@ fn import_extracts_a_playable_bundle() {
     let games = library::list(&root);
     assert_eq!(games.len(), 1);
     assert_eq!(games[0].executable(), game.executable());
-    assert!(library::find_game(&root, "com.ea.simpsonsarcade.bv").is_some());
-    assert!(library::find_game(&root, "TheSimpsons.app").is_some());
-    assert!(library::find_game(&root, "nope").is_none());
+    assert!(crate::find_game(&root, "com.ea.simpsonsarcade.bv").is_some());
+    assert!(crate::find_game(&root, "TheSimpsons.app").is_some());
+    assert!(crate::find_game(&root, "nope").is_none());
 
     let _ = std::fs::remove_dir_all(&root);
 }

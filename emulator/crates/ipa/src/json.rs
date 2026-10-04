@@ -23,8 +23,10 @@ impl Json {
         Json::Str(value.into())
     }
 
-    pub fn number(value: impl Into<f64>) -> Json {
-        Json::Number(value.into())
+    /// A JSON number.  Integers wider than `f64`'s 53-bit mantissa are rounded,
+    /// which is fine for the byte and file counts this is used for.
+    pub fn number(value: f64) -> Json {
+        Json::Number(value)
     }
 
     /// An object built from pairs; `None` values are skipped so the manifest
