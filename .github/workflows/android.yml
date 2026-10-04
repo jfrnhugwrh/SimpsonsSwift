@@ -17,7 +17,6 @@
 name: Android build
 
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       abis:
@@ -39,7 +38,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: android-${{ github.ref }}
@@ -201,24 +199,6 @@ jobs:
           path: artifacts/${{ matrix.abi }}
           if-no-files-found: error
           retention-days: 14
-
-      - name: Report the artifact on the pull request
-        if: ${{ matrix.abi == 'arm64-v8a' && github.event_name == 'pull_request' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          {
-            echo "### Android artifact — arm64-v8a"
-            echo
-            echo '```'
-            ls -l artifacts/arm64-v8a
-            file artifacts/arm64-v8a/simpsons-emu
-            echo
-            cat artifacts/arm64-v8a/BUILD_INFO.txt
-            echo '```'
-          } > /tmp/android.md
-          gh pr comment "$PR_NUMBER" --body-file /tmp/android.md
 
       - name: Summary
         run: |
