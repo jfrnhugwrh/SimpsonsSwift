@@ -40,6 +40,15 @@ simpsons-emu run   Simpsons.app/Simpsons --bundle Simpsons.app \
                    --trace --stats --screenshot frame.bmp --serve 8080
 ```
 
+To exercise the whole pipeline without the game, build a synthetic ARMv7
+Mach-O — real header, dyld tables, a lazy `_puts` stub and Darwin syscalls — and
+run it:
+
+```sh
+cargo run --example make_demo -- /tmp/demo-armv7     # writes the image
+simpsons-emu run /tmp/demo-armv7 --trace --stats     # -> "hello from the guest"
+```
+
 `run` boots the image (segments mapped at their Mach-O addresses, dyld imports
 bound to HLE trampolines, a Darwin-style initial stack), executes until the
 instruction budget is exhausted, the guest exits, or it traps. On a trap it

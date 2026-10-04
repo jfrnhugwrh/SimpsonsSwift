@@ -118,6 +118,9 @@ impl Machine {
                 Outcome::Continue => {}
                 Outcome::Trap(trap) => self.handle_trap(trap)?,
             }
+            // Guest instructions only: the HLE trampoline and the syscall traps
+            // are host work and are counted separately.
+            self.stats.instructions += 1;
             self.since_present += 1;
         }
     }
