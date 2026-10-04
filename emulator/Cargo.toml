@@ -1,0 +1,29 @@
+# Workspace for the Simpsons Arcade (iOS/ARMv7) emulator.
+#
+# NOTE: every crate in this workspace is `std`-only and has **no external
+# dependencies**.  That keeps `cargo build --offline` working in sandboxes
+# without crates.io access and matches the reference implementation, which is a
+# self-contained ARMv7 Mach-O executable.
+[workspace]
+resolver = "2"
+members = [
+    "crates/macho",
+    "crates/guestmem",
+    "crates/arm",
+    "crates/runtime",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+# Debug builds of an interpreter are painfully slow; keep some optimization.
+[profile.dev]
+opt-level = 1
