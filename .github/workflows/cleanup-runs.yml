@@ -19,8 +19,6 @@ on:
   schedule:
     # 00:00, 03:00, 06:00 … UTC
     - cron: '0 */3 * * *'
-  push:
-    branches: ['arena/**']   # TEMPORARY: verifying the purge on this branch
   workflow_dispatch:
     inputs:
       keep_per_workflow:

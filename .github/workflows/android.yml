@@ -27,11 +27,8 @@ name: Android APK
 
 on:
   push:
-    branches: [main, 'arena/**']
+    branches: [main]
     tags: ['v*']
-    paths-ignore:
-      - '**.md'
-      - '.github/workflows/cleanup-runs.yml'
   workflow_dispatch:
     inputs:
       profile:
