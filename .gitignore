@@ -1,0 +1,11 @@
+# Rust build output
+target/
+emulator/target/
+
+# Python bytecode (tools/gen_unicorn_golden.py)
+__pycache__/
+*.pyc
+
+# Local scratch
+*.dSYM/
+.DS_Store
