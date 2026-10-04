@@ -59,7 +59,7 @@ jobs:
       # On a failure the log tail is posted to the pull request, so it can be
       # read without opening the Actions log viewer.  Successful runs are quiet.
       - name: Report the result on the pull request
-        if: ${{ failure() && github.event_name == 'pull_request' }}
+        if: ${{ always() && github.event_name == 'pull_request' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -69,6 +69,9 @@ jobs:
             echo "### \`cargo test\` — $OUTCOME"
             echo
             echo '```'
+            echo '-- warnings and errors --'
+            grep -E '^(warning|error)' /tmp/ci.log | sort | uniq -c | sort -rn | head -40
+            echo
             grep -E '^(test result|running|error|warning|error\[)' /tmp/ci.log | tail -60
             echo '```'
             echo
