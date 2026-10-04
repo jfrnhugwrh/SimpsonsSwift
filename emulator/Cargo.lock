@@ -15,6 +15,7 @@ version = "0.1.0"
 dependencies = [
  "arm",
  "guestmem",
+ "ipa",
  "macho",
  "runtime",
 ]
@@ -22,6 +23,13 @@ dependencies = [
 [[package]]
 name = "guestmem"
 version = "0.1.0"
+
+[[package]]
+name = "ipa"
+version = "0.1.0"
+dependencies = [
+ "macho",
+]
 
 [[package]]
 name = "macho"
