@@ -182,7 +182,10 @@ Two workflows live in `.github/workflows/`:
   `armeabi-v7a`, `x86_64` and `x86` with the NDK the runner already ships, builds
   the demo image, assembles and signs `android/`, checks the result really is a
   signed APK carrying all four binaries, and attaches it to the run *and* to the
-  rolling `android-latest` release.  See [Android](#android).
+  rolling `android-latest` release.  A last, non-blocking job installs that APK
+  on an Android emulator, launches it, and checks that the packaged binary boots
+  the demo and that the preview reaches the app's `WebView` — the screenshot and
+  the device log are attached to the run.  See [Android](#android).
 * **`cleanup-runs.yml`** — deletes old workflow runs every three hours
   (`cron: 0 */3 * * *`), keeping only the run doing the deleting.  Dispatch it by
   hand to keep the newest few per workflow, to protect recent runs, or to do a

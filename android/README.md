@@ -27,9 +27,11 @@ workspace follows. The only build dependency is the Android Gradle plugin.
   `useLegacyPackaging = true`, which makes the installer unpack it instead of
   mapping it out of the APK) is what makes it runnable at all.
 * **The app runs it and reads its stdout** into the log view.
-* **`--serve <port> --bind 127.0.0.1`** gives the emulator's live framebuffer
-  page to a `WebView`. The port is loopback-only, so the preview never leaves
-  the device; cleartext is allowed for `127.0.0.1` alone.
+* **`--serve <port> --bind 127.0.0.1 --keep-serving`** gives the emulator's live
+  framebuffer page to a `WebView`. The port is loopback-only, so the preview
+  never leaves the device; cleartext is allowed for `127.0.0.1` alone; and the
+  server outlives the guest, so a program that exits in milliseconds (the demo)
+  still leaves its last frame, its log and the import panel on screen.
 * **Imports go through the emulator's own importer.** The file picker hands back
   a document, the app copies it into its cache and runs
   `simpsons-emu import … --dest <app files>/games`, so the validation is

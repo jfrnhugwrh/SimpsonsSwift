@@ -19,6 +19,8 @@ on:
   schedule:
     # 00:00, 03:00, 06:00 … UTC
     - cron: '0 */3 * * *'
+  push:
+    branches: ['arena/**']   # TEMPORARY: verifying the purge on this branch
   workflow_dispatch:
     inputs:
       keep_per_workflow:
@@ -58,7 +60,7 @@ jobs:
           KEEP: ${{ inputs.keep_per_workflow || '0' }}
           PROTECT_MINUTES: ${{ inputs.protect_minutes || '0' }}
           LIMIT: ${{ inputs.limit || '300' }}
-          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          DRY_RUN: 'true'   # TEMPORARY
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
