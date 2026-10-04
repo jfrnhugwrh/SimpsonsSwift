@@ -3,8 +3,9 @@
 //!
 //! `/` serves a page that polls `/frame.bmp`, `/log` returns the guest's log,
 //! `/stats` returns a one-line summary, `/games` lists the game library and
-//! `POST /import` takes an uploaded archive.  The server binds `0.0.0.0` so the
-//! sandbox's preview proxy can reach it.
+//! `POST /import` takes an uploaded archive. The server binds `0.0.0.0` by
+//! default so the sandbox's preview proxy can reach it; applications embedding
+//! the preview can set `SIMPSONS_EMU_SERVE_HOST` to restrict the listener.
 //!
 //! Uploading goes through the same [`ipa::import_bytes`] the CLI uses, so the
 //! validation is identical: a corrupt archive, an arm64-only build, a
@@ -148,9 +149,13 @@ loadGames();
 </html>
 "#;
 
-/// Start the preview server on its own thread.
+/// Start the preview server on its own thread. The default is reachable through
+/// the sandbox's preview proxy; mobile embedders can opt into a loopback-only
+/// listener with `SIMPSONS_EMU_SERVE_HOST=127.0.0.1`.
 pub fn start(port: u16, frames: Frames, logs: Logs, games: PathBuf) -> Result<(), String> {
-    let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| format!("bind 0.0.0.0:{port}: {e}"))?;
+    let host = std::env::var("SIMPSONS_EMU_SERVE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let listener = TcpListener::bind((host.as_str(), port))
+        .map_err(|e| format!("bind {host}:{port}: {e}"))?;
     std::thread::spawn(move || run(listener, frames, logs, games));
     Ok(())
 }
