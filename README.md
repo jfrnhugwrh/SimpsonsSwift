@@ -175,7 +175,7 @@ misc-control space being decoded as a branch).
 
 ## Continuous integration
 
-Two workflows live in `.github/workflows/`:
+The workflows live in `.github/workflows/`:
 
 * **`android.yml`** — builds the APK.  Runs on a push to `main`, on a `v*` tag
   and from the *Actions* tab.  It cross-compiles `simpsons-emu` for `arm64-v8a`,
@@ -208,6 +208,9 @@ Install the APK from the `android-latest` release, then
 * **Import .ipa** runs the emulator's own importer, with the same validation as
   the desktop CLI, on a decrypted copy of the game that you supply;
 * **Play** runs what you imported.
+
+The imported bundle lives in the app's private storage, the staged `.ipa` copy
+is deleted once the import finishes, and nothing is ever uploaded anywhere.
 
 Cross-compiling by hand, if you would rather not use CI:
 

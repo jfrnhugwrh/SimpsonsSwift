@@ -4,8 +4,10 @@
 //! `/` serves a page that polls `/frame.bmp`, `/log` returns the guest's log,
 //! `/stats` returns a one-line summary, `/games` lists the game library and
 //! `POST /import` takes an uploaded archive.  The server binds `0.0.0.0` by
-//! default so the sandbox's preview proxy can reach it; `--bind` narrows that
-//! (the Android app passes `127.0.0.1`, so the preview never leaves the phone).
+//! default so the sandbox's preview proxy can reach it; `--bind` (or
+//! `$SIMPSONS_EMU_SERVE_HOST`, for embedders that do not build the command
+//! line) narrows that — the Android app passes `127.0.0.1`, so the preview
+//! never leaves the phone.
 //!
 //! Uploading goes through the same [`ipa::import_bytes`] the CLI uses, so the
 //! validation is identical: a corrupt archive, an arm64-only build, a

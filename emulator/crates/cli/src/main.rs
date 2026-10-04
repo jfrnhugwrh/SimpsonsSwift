@@ -56,7 +56,8 @@ RUN OPTIONS:
     --tolerate-undefined      Skip over unknown instructions instead of stopping
     --screenshot <file.bmp>   Write the last presented frame
     --serve <port>            Serve a live framebuffer preview on <port>
-    --bind <addr>             Address the preview binds to (default 0.0.0.0)
+    --bind <addr>             Address the preview binds to (default 0.0.0.0,
+                              or $SIMPSONS_EMU_SERVE_HOST)
     --keep-serving            Keep the preview up after the guest stops
     --stats                   Print call statistics
 ";
@@ -127,6 +128,18 @@ fn command_line(args: &[String]) -> Vec<String> {
             .cloned()
             .collect(),
         None => Vec::new(),
+    }
+}
+
+/// Where the preview server listens: `--bind`, else `SIMPSONS_EMU_SERVE_HOST`,
+/// else every interface (what the sandbox's preview proxy needs).
+fn serve_host(args: &[String]) -> String {
+    if let Some(host) = flag(args, "--bind") {
+        return host.to_string();
+    }
+    match std::env::var("SIMPSONS_EMU_SERVE_HOST") {
+        Ok(host) if !host.is_empty() => host,
+        _ => "0.0.0.0".to_string(),
     }
 }
 
@@ -353,7 +366,9 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         let games = import::options_from(args).root.unwrap_or_else(ipa::default_root);
         // Everything but a sandbox wants this on loopback; the Android app
         // passes `--bind 127.0.0.1` so the preview is not on the user's Wi-Fi.
-        let host = flag(args, "--bind").unwrap_or("0.0.0.0").to_string();
+        // `SIMPSONS_EMU_SERVE_HOST` does the same for embedders that cannot
+        // control the command line.
+        let host = serve_host(args);
         serve::start(&host, port, Arc::clone(&frames), Arc::clone(&logs), games)?;
         println!("preview: http://{host}:{port}/  (open the port's preview URL)");
     }
@@ -460,7 +475,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // milliseconds would otherwise never show a preview at all.
     if let Some(port) = serve_port {
         if args.iter().any(|a| a == "--keep-serving") {
-            let host = flag(args, "--bind").unwrap_or("0.0.0.0");
+            let host = serve_host(args);
             println!("\npreview still serving on http://{host}:{port}/ — interrupt to stop");
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
