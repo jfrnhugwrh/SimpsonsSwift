@@ -64,10 +64,20 @@ pub fn describe_trap(trap: &Trap) -> String {
         Trap::Syscall { number } => format!("syscall {number}"),
         Trap::HleCall { address } => format!("HLE call at {address:#010x}"),
         Trap::SupervisorCall { immediate } => format!("svc #{immediate:#x}"),
-        Trap::Undefined { address, insn, thumb } => format!(
-            "undefined {} instruction {insn:#010x} at {address:#010x}",
-            if *thumb { "Thumb" } else { "ARM" }
-        ),
+        Trap::Undefined { address, insn, thumb } => {
+            if *thumb {
+                // Thumb encodings are stored as (first << 16) | second, so show
+                // the halfwords the way a disassembler would.
+                format!(
+                    "undefined Thumb instruction at {address:#010x}: \
+                     {:#06x} {:#06x} (32-bit form {insn:#010x})",
+                    insn >> 16,
+                    insn & 0xffff
+                )
+            } else {
+                format!("undefined ARM instruction {insn:#010x} at {address:#010x}")
+            }
+        }
         Trap::Memory { error, address, pc, access } => {
             format!("{access:?} fault at {address:#010x} (pc {pc:#010x}): {error}")
         }
