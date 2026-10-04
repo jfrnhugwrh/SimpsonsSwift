@@ -45,11 +45,10 @@ jobs:
       - name: Set up Android SDK and NDK
         uses: android-actions/setup-android@v4
         with:
-          packages: |
-            platform-tools
-            platforms;android-35
-            build-tools;35.0.0
-            ndk;27.2.12479018
+          # setup-android splits `packages` on spaces only (never on newlines), so
+          # this must stay on one line. A YAML block scalar here makes sdkmanager
+          # look for a single package literally named "platform-tools\nplatforms;...".
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018'
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
