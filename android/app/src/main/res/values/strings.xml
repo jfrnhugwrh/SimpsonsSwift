@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Simpsons Arcade</string>
+    <string name="play">Play</string>
+    <string name="demo">Demo</string>
+    <string name="import_ipa">Import .ipa</string>
+    <string name="stop">Stop</string>
+    <string name="log">Log</string>
+    <string name="preview">Preview</string>
+</resources>

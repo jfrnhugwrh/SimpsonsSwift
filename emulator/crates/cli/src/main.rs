@@ -55,7 +55,8 @@ RUN OPTIONS:
     --verbose                 Print the guest's log when it stops
     --tolerate-undefined      Skip over unknown instructions instead of stopping
     --screenshot <file.bmp>   Write the last presented frame
-    --serve <port>            Serve a live framebuffer preview on 0.0.0.0:<port>
+    --serve <port>            Serve a live framebuffer preview on <port>
+    --bind <addr>             Address the preview binds to (default 0.0.0.0)
     --stats                   Print call statistics
 ";
 
@@ -349,8 +350,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(port) = serve_port {
         let games = import::options_from(args).root.unwrap_or_else(ipa::default_root);
-        serve::start(port, Arc::clone(&frames), Arc::clone(&logs), games)?;
-        println!("preview: http://0.0.0.0:{port}/  (open the port's preview URL)");
+        // Everything but a sandbox wants this on loopback; the Android app
+        // passes `--bind 127.0.0.1` so the preview is not on the user's Wi-Fi.
+        let host = flag(args, "--bind").unwrap_or("0.0.0.0").to_string();
+        serve::start(&host, port, Arc::clone(&frames), Arc::clone(&logs), games)?;
+        println!("preview: http://{host}:{port}/  (open the port's preview URL)");
     }
 
     println!("loaded {path}: {} bytes", image.data.len());

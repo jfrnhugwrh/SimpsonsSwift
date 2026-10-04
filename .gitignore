@@ -9,3 +9,16 @@ __pycache__/
 # Local scratch
 *.dSYM/
 .DS_Store
+
+# Android app build output
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+
+# Staged into the app by the Android workflow: the cross-compiled emulator
+# binaries and the demo image are build products, not sources.
+android/app/src/main/jniLibs/
+android/app/src/main/assets/

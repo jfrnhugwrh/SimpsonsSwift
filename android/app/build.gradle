@@ -1,0 +1,102 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The CI workflow passes these in; a local `gradle assembleRelease` gets the
+// defaults and still produces an installable, debug-signed APK.
+def versionCodeValue = (System.getenv('ANDROID_VERSION_CODE') ?: '1') as Integer
+def versionNameValue = System.getenv('ANDROID_VERSION_NAME') ?: '0.1.0-local'
+def keystoreFile = System.getenv('ANDROID_KEYSTORE_FILE')
+
+android {
+    namespace 'com.simpsonsswift.emulator'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.simpsonsswift.emulator'
+        minSdk 24
+        targetSdk 34
+        versionCode versionCodeValue
+        versionName versionNameValue
+        // Only the four ABIs the emulator is cross-compiled for; anything else
+        // would ship an APK whose native binary is missing.
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // `simpsons-emu` is an executable, not a library: it has to be unpacked
+    // into the app's native library directory, because Android only lets a
+    // process exec files from there — never from the APK or from app data.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (keystoreFile) {
+                storeFile file(keystoreFile)
+                storePassword System.getenv('ANDROID_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('ANDROID_KEY_ALIAS')
+                keyPassword System.getenv('ANDROID_KEY_PASSWORD')
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            // Sideloaded builds have to be signed with something; without a
+            // keystore in the environment the debug key keeps the APK
+            // installable instead of emitting an unsigned one.
+            if (keystoreFile) {
+                signingConfig signingConfigs.release
+            } else {
+                signingConfig signingConfigs.debug
+            }
+        }
+        debug {
+            applicationIdSuffix '.debug'
+            versionNameSuffix '-debug'
+        }
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+// Fail early and loudly when the native binaries were not staged, rather than
+// shipping an APK that cannot do anything.
+tasks.register('checkNativeBinaries') {
+    doLast {
+        def abis = ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86']
+        def missing = abis.findAll { abi ->
+            !file("src/main/jniLibs/${abi}/libsimpsons-emu.so").isFile()
+        }
+        if (missing.size() == abis.size()) {
+            throw new GradleException(
+                    'No native emulator binaries in app/src/main/jniLibs/<abi>/libsimpsons-emu.so.\n' +
+                    'Cross-compile them first (see android/README.md) or run the "Android APK" workflow.')
+        }
+        if (!missing.isEmpty()) {
+            logger.warn("warning: APK will not support ${missing.join(', ')} (no libsimpsons-emu.so staged)")
+        }
+    }
+}
+
+tasks.named('preBuild') {
+    dependsOn 'checkNativeBinaries'
+}

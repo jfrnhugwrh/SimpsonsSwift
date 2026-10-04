@@ -1,0 +1,20 @@
+// Android front end for the emulator.  One module, no third-party libraries —
+// the same rule the Rust workspace follows.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'SimpsonsSwift'
+include ':app'

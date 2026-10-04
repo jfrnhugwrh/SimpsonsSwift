@@ -13,6 +13,7 @@ emulator/                      the emulator itself (std-only Rust workspace)
   crates/runtime/              loader, syscall layer, HLE for the iOS frameworks
   crates/ipa/                  .ipa reader: ZIP, DEFLATE, plist, validation, import
   crates/cli/                  `simpsons-emu import | games | info | dump | run`
+android/                       Android app that runs the emulator on a phone
 ```
 
 The C listing was used as the behavioural reference (symbol surface, syscall
@@ -176,27 +177,42 @@ misc-control space being decoded as a branch).
 
 Two workflows live in `.github/workflows/`:
 
-* **`tests.yml`** — builds and tests the workspace.  Triggered by pull requests
-  and by hand; *not* on every push.
-* **`android.yml`** — the Android build, `workflow_dispatch` only.  Run it from
-  the *Actions* tab: it cross-compiles `simpsons-emu` for `arm64-v8a`,
-  `armeabi-v7a`, `x86_64` and `x86` with the NDK the runner already ships (no SDK
-  or Gradle is downloaded), and attaches one artifact per ABI.  See
-  [Building for Android](#building-for-android).
+* **`android.yml`** — builds the APK.  Runs on a push to `main`, on a `v*` tag
+  and from the *Actions* tab.  It cross-compiles `simpsons-emu` for `arm64-v8a`,
+  `armeabi-v7a`, `x86_64` and `x86` with the NDK the runner already ships, builds
+  the demo image, assembles and signs `android/`, checks the result really is a
+  signed APK carrying all four binaries, and attaches it to the run *and* to the
+  rolling `android-latest` release.  See [Android](#android).
+* **`cleanup-runs.yml`** — deletes old workflow runs every three hours
+  (`cron: 0 */3 * * *`), keeping only the run doing the deleting.  Dispatch it by
+  hand to keep the newest few per workflow, to protect recent runs, or to do a
+  dry run.  It never touches releases or tags, which is why the APK is published
+  as a release asset: deleting a run deletes its artifacts with it.  GitHub only
+  runs schedules from the default branch, so this has to be on `main` to fire.
 
-### Building for Android
+## Android
 
-The repository's build system is cargo, so "the Android build" means
-cross-compiling the workspace for the Android targets; there is no Gradle project
-here to turn into an APK.  The workflow will produce one if an Android
-application project is ever added under `android/` — until then its `package`
-job says so explicitly rather than inventing an app.
+[`android/`](android/README.md) is a small, dependency-free app around the
+emulator: the APK carries the ordinary `simpsons-emu` binary as
+`lib/<abi>/libsimpsons-emu.so` (the only place Android still allows an exec),
+runs it, pipes its output into a log view, and points a `WebView` at the live
+framebuffer the emulator serves on loopback.
+
+Install the APK from the `android-latest` release, then
+
+* **Demo** boots the synthetic ARMv7 Mach-O that ships in the APK — the loader,
+  the interpreter and the HLE, with no copyrighted file involved;
+* **Import .ipa** runs the emulator's own importer, with the same validation as
+  the desktop CLI, on a decrypted copy of the game that you supply;
+* **Play** runs what you imported.
+
+Cross-compiling by hand, if you would rather not use CI:
 
 ```sh
 cd emulator
 rustup target add aarch64-linux-android
 export NDK="$ANDROID_NDK_HOME"                       # or the NDK you installed
-export CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+export CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
 cat >> ~/.cargo/config.toml <<EOF
 [target.aarch64-linux-android]
 linker = "$CC"
@@ -204,9 +220,9 @@ EOF
 cargo build --release --target aarch64-linux-android --bin simpsons-emu
 ```
 
-Each artifact also carries a `BUILD_INFO.txt` recording the rustc, NDK, API level
-and commit it was built from.  The game is not part of the artifact: import your
-own decrypted copy on the device with `simpsons-emu import`.
+That binary runs on a device on its own, too — `adb push` it to
+`/data/local/tmp/` and use it exactly like the desktop CLI.  The game is never
+part of any artifact: import your own decrypted copy with `simpsons-emu import`.
 
 ## Architecture notes
 

@@ -1,40 +1,52 @@
-# Manual Android build.
+# Builds the Android app and produces an APK you can actually install.
 #
-# Runs *only* from the Actions tab ("Run workflow") — never on push or on a pull
-# request — because it cross-compiles the emulator for four ABIs and there is no
-# reason to spend a runner on that for every commit.
+# The repository is a Rust workspace, so an APK takes two halves:
 #
-# What it builds is what this repository actually is: a Rust workspace.  Each job
-# cross-compiles `simpsons-emu` (and the workspace's libraries) for one Android
-# ABI with the NDK that the runner already ships, and uploads the result.  If an
-# Android application project is ever added under `android/`, the `package` job
-# picks it up and produces the APK/AAB as well; until then it reports that there
-# is nothing to package rather than inventing an app.
+#   emulator   cross-compiles `simpsons-emu` for the four Android ABIs with the
+#              NDK the runner already ships, and stages each binary as
+#              lib/<abi>/libsimpsons-emu.so — the one place Android still lets a
+#              process exec from.
+#   demo       builds the synthetic ARMv7 Mach-O (`make_demo`) that ships in the
+#              APK, so the app has something to boot before you import a game.
+#   apk        assembles android/ with Gradle, signs the APK, checks that it is
+#              really signed and really contains all four binaries, uploads it
+#              and refreshes the `android-latest` release.
 #
-# Nothing is downloaded that the runner does not already have: no SDK, no Gradle
-# and no NDK are installed unless they are genuinely missing.
+# The APK is signed with the repository's key when these secrets exist, and with
+# a throwaway key generated on the runner when they do not (an unsigned APK will
+# not install on anything):
+#
+#   ANDROID_KEYSTORE_BASE64    base64 of your .jks            (base64 -w0 key.jks)
+#   ANDROID_KEYSTORE_PASSWORD  store password
+#   ANDROID_KEY_ALIAS          key alias
+#   ANDROID_KEY_PASSWORD       key password (defaults to the store password)
+#
+# No game is downloaded, bundled or distributed by any of this.
 
-name: Android build
+name: Android APK
 
 on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/cleanup-runs.yml'
   workflow_dispatch:
     inputs:
-      abis:
-        description: 'ABIs to build (JSON array)'
-        required: false
-        default: '["arm64-v8a", "armeabi-v7a", "x86_64", "x86"]'
       profile:
-        description: 'Cargo profile'
+        description: 'Cargo profile for the emulator binary'
         required: false
         default: 'release'
         type: choice
         options:
           - release
           - debug
-      api_level:
-        description: 'Minimum Android API level to link against'
+      publish_release:
+        description: 'Attach the APK to the android-latest release'
         required: false
-        default: '21'
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -45,46 +57,47 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The workspace has no third-party dependencies; keep cargo from reaching the
-  # network at all so a build is reproducible and cannot drift with crates.io.
+  # The workspace has no third-party dependencies; keep cargo off the network so
+  # a build cannot drift with crates.io.
   CARGO_NET_OFFLINE: 'true'
+  # Matches the app's minSdk.
+  ANDROID_API_LEVEL: '24'
+  APP_ID: com.simpsonsswift.emulator
 
 jobs:
-  build:
-    name: build (${{ matrix.abi }})
+  emulator:
+    name: emulator (${{ matrix.abi }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        abi: ${{ fromJSON(inputs.abis || '["arm64-v8a", "armeabi-v7a", "x86_64", "x86"]') }}
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
     defaults:
       run:
         shell: bash
     env:
-      # `inputs` is only populated by workflow_dispatch; the fallbacks keep the
-      # job runnable however it was started.
-      API_LEVEL: ${{ inputs.api_level || '21' }}
       PROFILE: ${{ inputs.profile || 'release' }}
+      # Android 15 devices can use 16 KB pages; link for them.
+      RUSTFLAGS: -C link-arg=-Wl,-z,max-page-size=16384
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Reuse the previous compilation of this branch; there is nothing to fetch
-      # because the workspace is dependency-free.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: emulator
+          key: ${{ matrix.abi }}
 
       - name: Map the ABI to a Rust target
         run: |
           set -euo pipefail
           case "${{ matrix.abi }}" in
-            arm64-v8a)    target=aarch64-linux-android;    triple=aarch64-linux-android ;;
-            armeabi-v7a)  target=armv7-linux-androideabi;  triple=armv7a-linux-androideabi ;;
-            x86_64)       target=x86_64-linux-android;     triple=x86_64-linux-android ;;
-            x86)          target=i686-linux-android;       triple=i686-linux-android ;;
-            *) echo "::error::unknown ABI '${{ matrix.abi }}' (expected arm64-v8a, armeabi-v7a, x86_64 or x86)"; exit 1 ;;
+            arm64-v8a)    target=aarch64-linux-android;   triple=aarch64-linux-android ;;
+            armeabi-v7a)  target=armv7-linux-androideabi; triple=armv7a-linux-androideabi ;;
+            x86_64)       target=x86_64-linux-android;    triple=x86_64-linux-android ;;
+            x86)          target=i686-linux-android;      triple=i686-linux-android ;;
+            *) echo "::error::unknown ABI '${{ matrix.abi }}'"; exit 1 ;;
           esac
           {
             echo "RUST_TARGET=$target"
@@ -101,9 +114,7 @@ jobs:
           if [ -n "$ndk" ] && [ -n "$(host_tag "$ndk")" ]; then
             echo "using the NDK the runner already has: $ndk"
           else
-            # Only reached on a runner image without an NDK: install just the
-            # NDK with the SDK command line tools, not the whole SDK.
-            echo "::warning::no NDK found; installing one with the preinstalled SDK command line tools"
+            echo "::warning::no NDK on this runner; installing one with sdkmanager"
             sdkmanager="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
             [ -x "$sdkmanager" ] || sdkmanager="$(command -v sdkmanager || true)"
             [ -x "$sdkmanager" ] || { echo "::error::neither an NDK nor sdkmanager is available"; exit 1; }
@@ -129,145 +140,304 @@ jobs:
       - name: Add the Rust target
         run: rustup target add "$RUST_TARGET"
 
-      # Cargo needs to know which linker to use for the Android target; the NDK
-      # wrapper scripts carry the API level and the right `--sysroot`.
-      - name: Configure the NDK linker
+      - name: Point cargo at the NDK linker
         run: |
           set -euo pipefail
+          linker="$NDK_BIN/${NDK_TRIPLE}${ANDROID_API_LEVEL}-clang"
+          test -x "$linker"
           mkdir -p "$HOME/.cargo"
           {
             echo "[target.$RUST_TARGET]"
-            echo "linker = \"$NDK_BIN/${NDK_TRIPLE}$API_LEVEL-clang\""
+            echo "linker = \"$linker\""
           } >> "$HOME/.cargo/config.toml"
           cat "$HOME/.cargo/config.toml"
-          test -x "$NDK_BIN/${NDK_TRIPLE}$API_LEVEL-clang"
 
-      - name: Build
+      - name: Build simpsons-emu
         working-directory: emulator
         run: |
           set -euo pipefail
-          profile="$PROFILE"
-          if [ "$profile" = release ]; then
+          if [ "$PROFILE" = release ]; then
             cargo build --release --target "$RUST_TARGET" --bin simpsons-emu
-            out="target/$RUST_TARGET/release"
+            out="target/$RUST_TARGET/release/simpsons-emu"
           else
             cargo build --target "$RUST_TARGET" --bin simpsons-emu
-            out="target/$RUST_TARGET/debug"
+            out="target/$RUST_TARGET/debug/simpsons-emu"
           fi
-          echo "OUTPUT_DIR=$out" >> "$GITHUB_ENV"
-          file "$out/simpsons-emu"
-
-      - name: Stage the artifact
-        working-directory: emulator
-        run: |
-          set -euo pipefail
-          abi="${{ matrix.abi }}"
-          stage="../artifacts/$abi"
-          mkdir -p "$stage"
-          cp "$OUTPUT_DIR/simpsons-emu" "$stage/"
-          # Strip the release binary the way a packaged app would; debug builds
-          # keep their symbols.
+          file "$out"
+          # It has to be position independent (ET_DYN) or Android will not run it.
+          "$NDK_BIN/llvm-readelf" -h "$out" | grep -E '^\s*Type:' | grep -q 'DYN' \
+            || { echo "::error::$out is not a position-independent executable"; exit 1; }
+          install -D -m 0755 "$out" "../staging/${{ matrix.abi }}/libsimpsons-emu.so"
           if [ "$PROFILE" = release ]; then
-            "$NDK_BIN/llvm-strip" --strip-unneeded "$stage/simpsons-emu" || true
+            "$NDK_BIN/llvm-strip" --strip-unneeded "../staging/${{ matrix.abi }}/libsimpsons-emu.so"
           fi
-          {
-            echo "abi:             $abi"
-            echo "rust target:     $RUST_TARGET"
-            echo "api level:       $API_LEVEL"
-            echo "profile:         $PROFILE"
-            echo "rustc:           $(rustc --version)"
-            echo "cargo:           $(cargo --version)"
-            echo "ndk:             $ANDROID_NDK_HOME"
-            echo "clang:           $("$NDK_BIN/clang" --version | head -1)"
-            echo "commit:          $GITHUB_SHA"
-            echo "built:           $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo
-            echo "Run it on a device with adb or in Termux:"
-            echo "  adb push simpsons-emu /data/local/tmp/ && adb shell /data/local/tmp/simpsons-emu games"
-            echo
-            echo "The game itself is not included and is not downloaded: import your own"
-            echo "decrypted copy of The Simpsons Arcade v1.1.43 with"
-            echo "  simpsons-emu import 'The Simpsons Arcade v1.1.43.ipa'"
-          } > "$stage/BUILD_INFO.txt"
-          chmod +x "$stage/simpsons-emu"
-          ls -la "$stage"
+          ls -l "../staging/${{ matrix.abi }}/libsimpsons-emu.so"
 
-      - name: Upload the build
+      - name: Upload the native binary
         uses: actions/upload-artifact@v4
         with:
-          name: simpsons-emu-android-${{ matrix.abi }}
-          path: artifacts/${{ matrix.abi }}
+          name: jnilibs-${{ matrix.abi }}
+          path: staging/${{ matrix.abi }}/libsimpsons-emu.so
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
 
-      - name: Summary
-        run: |
-          {
-            echo "### Android build — ${{ matrix.abi }}"
-            echo
-            echo "| | |"
-            echo "|---|---|"
-            echo "| Rust target | \`$RUST_TARGET\` |"
-            echo "| API level | $API_LEVEL |"
-            echo "| Profile | $PROFILE |"
-            echo "| NDK | \`$ANDROID_NDK_HOME\` |"
-            echo "| Commit | \`$GITHUB_SHA\` |"
-            echo
-            echo "Artifact: \`simpsons-emu-android-${{ matrix.abi }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # Packages an APK/AAB when this repository has an Android application project.
-  # Today it does not (the repository is a Rust workspace), so the job detects
-  # that and stops after the notice instead of failing or fabricating an app.
-  package:
-    name: package (apk/aab)
+  demo:
+    name: demo image
     runs-on: ubuntu-latest
-    needs: build
     steps:
       - uses: actions/checkout@v4
 
-      - name: Look for an Android application project
-        id: detect
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: emulator
+          key: demo
+
+      # A real ARMv7 Mach-O with dyld tables, a lazy `_puts` stub and Darwin
+      # syscalls: what the app boots when no game has been imported.
+      - name: Build the demo image
+        working-directory: emulator
         run: |
           set -euo pipefail
-          if ls android/build.gradle* android/settings.gradle* android/gradlew >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
+          cargo run -p cli --example make_demo -- ../demo-armv7
+          ls -l ../demo-armv7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-image
+          path: demo-armv7
+          if-no-files-found: error
+          retention-days: 7
+
+  apk:
+    name: APK
+    runs-on: ubuntu-latest
+    needs: [emulator, demo]
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the native binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: jnilibs-*
+          path: downloads
+
+      - name: Download the demo image
+        uses: actions/download-artifact@v4
+        with:
+          name: demo-image
+          path: downloads/demo
+
+      - name: Stage everything the APK has to carry
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          staged=0
+          for directory in downloads/jnilibs-*; do
+            abi="${directory#downloads/jnilibs-}"
+            install -D -m 0755 "$directory/libsimpsons-emu.so" \
+              "android/app/src/main/jniLibs/$abi/libsimpsons-emu.so"
+            staged=$((staged + 1))
+          done
+          [ "$staged" -gt 0 ] || { echo "::error::no native binaries were produced"; exit 1; }
+          install -D -m 0644 downloads/demo/demo-armv7 android/app/src/main/assets/demo-armv7
+          find android/app/src/main/jniLibs android/app/src/main/assets -type f -exec ls -l {} +
+
+      - name: Version the build
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "no android/ Gradle project in this repository — nothing to package"
-            {
-              echo "### Android package"
-              echo
-              echo "This repository has no Gradle project under \`android/\`, so there is no"
-              echo "APK or AAB to build.  The \`build\` jobs produced the Android binaries"
-              echo "from the repository's own build system (cargo + the NDK); those are the"
-              echo "artifacts attached to this run."
-            } >> "$GITHUB_STEP_SUMMARY"
+            version="0.1.0-${GITHUB_RUN_NUMBER}-$(git rev-parse --short HEAD)"
           fi
+          {
+            echo "ANDROID_VERSION_CODE=${GITHUB_RUN_NUMBER}"
+            echo "ANDROID_VERSION_NAME=$version"
+          } >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version $version (code $GITHUB_RUN_NUMBER)"
 
       - uses: actions/setup-java@v4
-        if: steps.detect.outputs.exists == 'true'
         with:
           distribution: temurin
           java-version: '17'
 
-      # Gradle comes from the project's wrapper, so no separate install and no
-      # version drift between the runner and the project.
-      - name: Build the APK and the AAB
-        if: steps.detect.outputs.exists == 'true'
-        working-directory: android
+      - name: Make sure the SDK has what the build needs
         run: |
           set -euo pipefail
-          chmod +x ./gradlew
-          ./gradlew --no-daemon --stacktrace assembleRelease bundleRelease
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          [ -n "$sdk" ] || { echo "::error::no Android SDK on this runner"; exit 1; }
+          sdkmanager="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$sdkmanager" ] || sdkmanager="$(command -v sdkmanager)"
+          yes 2>/dev/null | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$sdkmanager" "platforms;android-34" "build-tools;34.0.0" >/dev/null
+          echo "BUILD_TOOLS=$sdk/build-tools/34.0.0" >> "$GITHUB_ENV"
+          echo "sdk: $sdk"
 
-      - name: Upload the APK and the AAB
-        if: steps.detect.outputs.exists == 'true'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Prepare the signing key
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keystore="$RUNNER_TEMP/release.jks"
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$keystore"
+            alias="${KEY_ALIAS:-release}"
+            store_password="${KEYSTORE_PASSWORD:-}"
+            key_password="${KEY_PASSWORD:-$store_password}"
+            kind="the repository's release key"
+          else
+            # Nothing configured: a throwaway key still produces an APK that
+            # installs.  Updates will ask to uninstall first, because the key
+            # changes from run to run — add the secrets above to fix that.
+            alias=ci
+            store_password=simpsons
+            key_password=simpsons
+            keytool -genkeypair -keystore "$keystore" -storetype PKCS12 \
+              -storepass "$store_password" -keypass "$key_password" -alias "$alias" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=SimpsonsSwift CI, OU=GitHub Actions, O=SimpsonsSwift, C=US" >/dev/null
+            kind="a throwaway key generated on the runner"
+            echo "::warning::signed with $kind; set ANDROID_KEYSTORE_BASE64 and friends for a stable signature"
+          fi
+          {
+            echo "ANDROID_KEYSTORE_FILE=$keystore"
+            echo "ANDROID_KEYSTORE_PASSWORD=$store_password"
+            echo "ANDROID_KEY_ALIAS=$alias"
+            echo "ANDROID_KEY_PASSWORD=$key_password"
+          } >> "$GITHUB_ENV"
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble the APK
+        working-directory: android
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Name, verify and keep the APK
+        id: apk
+        run: |
+          set -euo pipefail
+          built=android/app/build/outputs/apk/release/app-release.apk
+          [ -f "$built" ] || { echo "::error::Gradle produced no APK"; ls -R android/app/build/outputs || true; exit 1; }
+
+          mkdir -p dist
+          name="simpsons-emu-${ANDROID_VERSION_NAME}.apk"
+          cp "$built" "dist/$name"
+
+          echo "--- signature ---"
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "dist/$name"
+
+          echo "--- manifest ---"
+          "$BUILD_TOOLS/aapt2" dump badging "dist/$name" | head -8
+
+          # The emulator binary is an executable: it is only usable if the
+          # installer unpacks it, which only happens with extractNativeLibs.
+          "$BUILD_TOOLS/aapt2" dump xmltree --file AndroidManifest.xml "dist/$name" \
+            | grep -q 'extractNativeLibs.*=true' \
+            || { echo "::error::extractNativeLibs is not true — the binary could never be executed"; exit 1; }
+
+          echo "--- payload ---"
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            unzip -l "dist/$name" | grep -q "lib/$abi/libsimpsons-emu.so" \
+              || { echo "::error::lib/$abi/libsimpsons-emu.so is missing from the APK"; exit 1; }
+          done
+          unzip -l "dist/$name" | grep -E 'lib/|assets/'
+
+          size="$(du -h "dist/$name" | cut -f1)"
+          {
+            echo "name=$name"
+            echo "path=dist/$name"
+            echo "size=$size"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:
-          name: simpsons-emu-android-package
-          path: |
-            android/**/build/outputs/apk/**/*.apk
-            android/**/build/outputs/bundle/**/*.aab
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
+          compression-level: 0
+
+      # Workflow runs (and their artifacts) are purged every three hours by
+      # cleanup-runs.yml, so the release is what keeps an installable APK
+      # around — and a release asset downloads as a plain .apk, not as a zip.
+      - name: Publish the APK to a release
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK: ${{ steps.apk.outputs.path }}
+          SIGNED_WITH: ${{ steps.signing.outputs.kind }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            title="$tag"
+            flags=()
+          else
+            tag="android-latest"
+            title="Android build (${ANDROID_VERSION_NAME})"
+            flags=(--prerelease)
+            # Roll the pointer forward so the release matches this commit.
+            gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          fi
+
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "Install \`$(basename "$APK")\` on a phone or tablet: Android 7.0 or newer, all four ABIs in one APK."
+            echo
+            echo "* built from \`${GITHUB_SHA}\`"
+            echo "* signed with ${SIGNED_WITH}"
+            echo "* the emulator ships **no game**: tap *Demo* to boot the synthetic ARMv7 image,"
+            echo "  or *Import .ipa* to add your own decrypted copy of The Simpsons Arcade v1.1.43."
+            echo
+            echo "Sideloading: let your browser or file manager install unknown apps, open the"
+            echo "\`.apk\`, confirm."
+          } > "$notes"
+
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$title" --notes-file "$notes" --target "$GITHUB_SHA" "${flags[@]}"
+          else
+            gh release edit "$tag" --title "$title" --notes-file "$notes"
+          fi
+          gh release upload "$tag" "$APK" --clobber
+          echo "RELEASE_URL=$(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_ENV"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Android APK"
+            echo
+            if [ -n "${{ steps.apk.outputs.name }}" ]; then
+              echo "| | |"
+              echo "|---|---|"
+              echo "| APK | \`${{ steps.apk.outputs.name }}\` (${{ steps.apk.outputs.size }}) |"
+              echo "| Version | ${ANDROID_VERSION_NAME} (code ${ANDROID_VERSION_CODE}) |"
+              echo "| ABIs | arm64-v8a, armeabi-v7a, x86_64, x86 |"
+              echo "| minSdk / targetSdk | 24 / 34 |"
+              echo "| Signed with | ${{ steps.signing.outputs.kind }} |"
+              echo "| Commit | \`${GITHUB_SHA}\` |"
+              [ -n "${RELEASE_URL:-}" ] && echo "| Release | ${RELEASE_URL} |"
+              echo
+              echo "Download it from the artifacts below (GitHub wraps artifacts in a zip) or"
+              echo "straight from the release, which serves the \`.apk\` as-is."
+            else
+              echo "The APK was not produced; see the failing step above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
