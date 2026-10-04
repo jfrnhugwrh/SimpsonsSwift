@@ -11,6 +11,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.OpenableColumns;
+import android.util.Log;
 import android.view.View;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -41,7 +42,16 @@ import java.util.concurrent.Executors;
  */
 public class MainActivity extends Activity implements EmulatorSession.Listener {
 
+    private static final String TAG = "SimpsonsEmu";
+
     private static final int REQUEST_IPA = 4711;
+
+    /**
+     * {@code adb shell am start -n com.simpsonsswift.emulator/.MainActivity --ez autostart_demo true}
+     * boots the demo image without anyone tapping anything; the workflow's
+     * smoke test uses it to prove the packaged binary really runs.
+     */
+    private static final String EXTRA_AUTOSTART_DEMO = "autostart_demo";
 
     /** Name of the synthetic ARMv7 Mach-O that ships with the APK. */
     private static final String DEMO_ASSET = "demo-armv7";
@@ -67,6 +77,7 @@ public class MainActivity extends Activity implements EmulatorSession.Listener {
     private GameLibrary.Game game;
     private File demoImage;
     private boolean previewVisible;
+    private boolean autostartDemo;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -116,6 +127,7 @@ public class MainActivity extends Activity implements EmulatorSession.Listener {
             }
         });
 
+        autostartDemo = getIntent() != null && getIntent().getBooleanExtra(EXTRA_AUTOSTART_DEMO, false);
         stopButton.setEnabled(false);
         showPreview(false);
         append("Simpsons Arcade — ARMv7 iOS emulator");
@@ -171,6 +183,10 @@ public class MainActivity extends Activity implements EmulatorSession.Listener {
                         demoButton.setEnabled(unpacked != null);
                         describeLibrary(library);
                         refreshStatus();
+                        if (autostartDemo && unpacked != null) {
+                            autostartDemo = false;
+                            runDemo();
+                        }
                     }
                 });
             }
@@ -504,6 +520,7 @@ public class MainActivity extends Activity implements EmulatorSession.Listener {
     }
 
     private void append(String text) {
+        Log.i(TAG, text);
         log.append(text).append('\n');
         if (log.length() > LOG_LIMIT) {
             log.delete(0, log.length() - LOG_LIMIT);

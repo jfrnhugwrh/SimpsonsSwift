@@ -343,7 +343,8 @@ jobs:
           "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "dist/$name"
 
           echo "--- manifest ---"
-          "$BUILD_TOOLS/aapt2" dump badging "dist/$name" | head -8
+          badging="$("$BUILD_TOOLS/aapt2" dump badging "dist/$name")"
+          echo "$badging" | head -8
 
           # The emulator binary is an executable: it is only usable if the
           # installer unpacks it, which only happens with extractNativeLibs.
@@ -359,10 +360,18 @@ jobs:
           unzip -l "dist/$name" | grep -E 'lib/|assets/'
 
           size="$(du -h "dist/$name" | cut -f1)"
+          package="$(echo "$badging" | sed -n "s/^package: //p")"
+          sdks="$(echo "$badging" | grep -E '^(sdkVersion|targetSdkVersion):' | tr '\n' ' ')"
+          signer="$("$BUILD_TOOLS/apksigner" verify --print-certs "dist/$name" \
+            | sed -n 's/^Signer #1 certificate DN: //p')"
+          echo "::notice title=APK::$name ($size) — $package $sdks signer: ${signer:-unknown}"
           {
             echo "name=$name"
             echo "path=dist/$name"
             echo "size=$size"
+            echo "package=$package"
+            echo "sdks=$sdks"
+            echo "signer=$signer"
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload the APK
@@ -419,6 +428,7 @@ jobs:
           echo "RELEASE_URL=$(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_ENV"
 
       - name: Summary
+        id: summary
         if: always()
         run: |
           {
@@ -430,8 +440,9 @@ jobs:
               echo "| APK | \`${{ steps.apk.outputs.name }}\` (${{ steps.apk.outputs.size }}) |"
               echo "| Version | ${ANDROID_VERSION_NAME} (code ${ANDROID_VERSION_CODE}) |"
               echo "| ABIs | arm64-v8a, armeabi-v7a, x86_64, x86 |"
-              echo "| minSdk / targetSdk | 24 / 34 |"
-              echo "| Signed with | ${{ steps.signing.outputs.kind }} |"
+              echo "| Package | ${{ steps.apk.outputs.package }} |"
+              echo "| SDK | ${{ steps.apk.outputs.sdks }} (minSdk 24, targetSdk 34) |"
+              echo "| Signed with | ${{ steps.signing.outputs.kind }}, \`${{ steps.apk.outputs.signer }}\` |"
               echo "| Commit | \`${GITHUB_SHA}\` |"
               [ -n "${RELEASE_URL:-}" ] && echo "| Release | ${RELEASE_URL} |"
               echo
@@ -439,5 +450,87 @@ jobs:
               echo "straight from the release, which serves the \`.apk\` as-is."
             else
               echo "The APK was not produced; see the failing step above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Proof that the APK is usable and not just well-formed: install it on a real
+  # Android image, launch it, and check that the packaged binary boots the demo
+  # and serves its preview.  Informational — a flaky emulator must not turn a
+  # good APK red, so this job is allowed to fail.
+  smoke:
+    name: smoke test
+    runs-on: ubuntu-latest
+    needs: apk
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the APK
+        uses: actions/download-artifact@v4
+        with:
+          pattern: simpsons-emu-*.apk
+          path: downloads
+          merge-multiple: true
+
+      - name: Download the x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: jnilibs-x86_64
+          path: downloads/jnilibs-x86_64
+
+      - name: Download the demo image
+        uses: actions/download-artifact@v4
+        with:
+          name: demo-image
+          path: downloads/demo-image
+
+      - name: Let the runner use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install, launch and watch it run
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: default
+          arch: x86_64
+          profile: pixel_2
+          ram-size: 3072M
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: bash .github/scripts/smoke-test.sh
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test
+          path: |
+            smoke/*.txt
+            smoke/*.png
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Smoke test"
+            echo
+            if [ -f smoke/verdict.txt ]; then
+              cat smoke/verdict.txt
+            else
+              echo "The emulator did not get far enough to report; see the job log."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
