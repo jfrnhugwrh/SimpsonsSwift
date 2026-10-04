@@ -60,7 +60,7 @@ jobs:
           KEEP: ${{ inputs.keep_per_workflow || '0' }}
           PROTECT_MINUTES: ${{ inputs.protect_minutes || '0' }}
           LIMIT: ${{ inputs.limit || '300' }}
-          DRY_RUN: 'true'   # TEMPORARY
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
@@ -144,6 +144,8 @@ jobs:
               fi
             fi
           done < doomed.tsv
+
+          echo "::notice title=Purge::deleted $deleted of $total run(s) — kept $kept, $young too young, $running still running, $stopped over the limit, $failed failed"
 
           {
             echo "### Purged workflow runs"
