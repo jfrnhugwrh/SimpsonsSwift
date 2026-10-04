@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 concurrency:
   group: tests-${{ github.ref }}
@@ -33,18 +34,49 @@ jobs:
         with:
           workspaces: emulator
 
-      - name: Toolchain
+      - name: Build and test
+        id: build
         run: |
-          rustc --version
-          cargo --version
+          set -uo pipefail
+          {
+            echo "== toolchain"
+            rustc --version
+            cargo --version
+            echo
+            echo "== cargo build --workspace --all-targets"
+            cargo build --workspace --all-targets
+            echo
+            echo "== cargo test --workspace"
+            cargo test --workspace
+            echo
+            echo "== cargo build --workspace --release"
+            cargo build --workspace --release
+          } 2>&1 | tee /tmp/ci.log
 
-      - name: Build
-        run: cargo build --workspace --all-targets
-
-      # The 334 differential instruction cases, the per-crate suites, the IPA
-      # importer's tests and the end-to-end runtime tests.
-      - name: Test
-        run: cargo test --workspace
-
-      - name: Release build
-        run: cargo build --workspace --release
+      # The log tail is posted to the pull request so a failure can be read
+      # without opening the Actions log viewer.
+      - name: Report the result on the pull request
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          {
+            echo "### \`cargo test\` — $OUTCOME"
+            echo
+            echo '```'
+            grep -E '^(test result|running|error|warning: unused|error\[)' /tmp/ci.log | tail -40
+            echo '```'
+            if [ "$OUTCOME" != success ]; then
+              echo
+              echo '<details><summary>last 250 lines</summary>'
+              echo
+              echo '```'
+              tail -250 /tmp/ci.log
+              echo '```'
+              echo
+              echo '</details>'
+            fi
+          } > /tmp/body.md
+          gh pr comment "$PR_NUMBER" --body-file /tmp/body.md
