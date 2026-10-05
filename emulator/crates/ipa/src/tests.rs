@@ -163,17 +163,10 @@ fn inflate_rejects_an_over_subscribed_code() {
 
 #[test]
 fn inflate_decodes_15_bit_huffman_codes() {
-    // Construct a canonical Huffman tree with 15-bit codes.
-    // Lengths: symbols 0 and 1 have length 15; symbols 2..=15 have lengths 14 down to 1.
-    // Sum of 2^-len: 2*(2^-15) + sum_{i=1..14} 2^-i = 2^-14 + (1 - 2^-14) = 1 (complete tree).
-    let mut lengths = vec![0u8; 288];
-    lengths[0] = 15;
-    lengths[1] = 15;
-    for i in 2..=15 {
-        lengths[i] = (16 - i) as u8;
-    }
-    // Symbol 256 (end-of-block) needs a code: let symbol 256 be symbol 1 with length 15.
-    // Specifically, let literal 0 be len 15, and EOB (256) be len 15.
+    // Construct a complete canonical tree whose deepest codes are 15 bits:
+    // literal 0 and EOB (256) have length 15, symbols 1..=14 get lengths
+    // 14 down to 1.  Sum of 2^-len: 2*(2^-15) + sum_{i=1..14} 2^-i
+    //                              = 2^-14 + (1 - 2^-14) = 1.
     let mut lit_lengths = vec![0u8; 288];
     lit_lengths[0] = 15;
     lit_lengths[256] = 15; // EOB
@@ -181,18 +174,10 @@ fn inflate_decodes_15_bit_huffman_codes() {
         lit_lengths[i] = (15 - i) as u8; // lengths 14 down to 1 for symbols 1..14
     }
 
-    // Dynamic block with these literal lengths and 1 dummy distance code.
-    let mut bits = Bits::new();
-    bits.push(1, 1); // BFINAL = 1
-    bits.push(2, 2); // BTYPE = dynamic
-    bits.push(288 - 257, 5); // HLIT: 288 codes -> value 31
-    bits.push(0, 5); // HDIST: 1 code -> value 0
-    // We can write literal lengths directly or with uncompressed code lengths.
-    // In test_support we have dynamic deflate helpers.
-    // Testing the Huffman struct directly:
     let huffman = crate::inflate::Huffman::from_lengths(&lit_lengths).expect("valid complete tree");
-    // Symbol 256 with length 15 has canonical code 111111111111111 (15 ones).
-    let mut br_data = vec![0xff; 4];
+    // Canonical order keeps both 15-bit codes last, and EOB (256) follows
+    // literal 0 within that length, so EOB's code is fifteen 1 bits.
+    let br_data = [0xffu8; 4];
     let mut br = crate::inflate::BitReader::new(&br_data);
     let decoded = huffman.decode(&mut br).expect("decodes 15-bit code");
     assert_eq!(decoded, 256);
