@@ -41,7 +41,7 @@ pub const MAX_INFLATED: usize = 1 << 31;
 /// LSB-first bit reader.  DEFLATE packs ordinary fields least-significant bit
 /// first, but Huffman codes are packed most-significant bit first — hence
 /// [`Huffman::decode`] pulls one bit at a time instead of a whole field.
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
     acc: u32,
@@ -49,7 +49,7 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         BitReader { data, pos: 0, acc: 0, bits: 0 }
     }
 
@@ -151,7 +151,7 @@ impl Huffman {
         Ok(Huffman { counts, symbols })
     }
 
-    fn decode(&self, br: &mut BitReader) -> Result<u16> {
+    pub(crate) fn decode(&self, br: &mut BitReader) -> Result<u16> {
         let mut code: i32 = 0;
         let mut first: i32 = 0;
         let mut index: i32 = 0;
