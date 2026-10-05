@@ -227,7 +227,7 @@ fn nsstring_empty(hle: &mut Hle<'_>, _receiver: u32) -> Result<u32> {
 
 /// Pass the receiver through for string combinators (`appending...`); the
 /// exact composition does not matter for the game's own glue.
-fn nsstring_self(hle: &mut Hle<'_>, receiver: u32) -> Result<u32> {
+fn nsstring_self(_hle: &mut Hle<'_>, receiver: u32) -> Result<u32> {
     Ok(receiver)
 }
 
