@@ -391,19 +391,21 @@ fn imported_objc_class_symbols_get_real_class_objects() {
     let image = macho::MachO::from_bytes(bytes).expect("fixture parses");
     let machine = Machine::boot(image, &options()).expect("fixture loads");
 
+    // Copy the address out of the import table right away: `machine` is moved
+    // below, so no borrow of `machine.image.imports` may stay alive.
     let binding = machine
         .image
         .imports
         .iter()
         .find(|i| i.symbol == "_OBJC_CLASS_$_Widget")
-        .expect("the class symbol is bound");
+        .expect("the class symbol is bound")
+        .trampoline;
     assert!(
-        binding.trampoline >= 0x7001_0000 && binding.trampoline < 0x7002_0000,
-        "the slot holds a synthetic class object, not a trampoline ({:#x})",
-        binding.trampoline
+        binding >= 0x7001_0000 && binding < 0x7002_0000,
+        "the slot holds a synthetic class object, not a trampoline ({binding:#x})"
     );
     assert_eq!(
-        machine.sys.host_classes.get(&binding.trampoline).map(String::as_str),
+        machine.sys.host_classes.get(&binding).map(String::as_str),
         Some("Widget"),
         "the bridge knows the class the slot points at"
     );
@@ -411,11 +413,11 @@ fn imported_objc_class_symbols_get_real_class_objects() {
     // And the class is a working receiver: `+[Widget alloc]` allocates.
     let mut machine = machine;
     let sel = write_selector(&mut machine, "alloc");
-    machine.cpu.r[0] = binding.trampoline;
+    machine.cpu.r[0] = binding;
     machine.cpu.r[1] = sel;
     machine.cpu.r[14] = machine.image.entry; // any executable address
     machine.hle_dispatch("_objc_msgSend").expect("alloc dispatches");
     let instance = machine.cpu.r[0];
-    assert!(instance != 0 && instance != binding.trampoline, "alloc produced an object");
-    assert_eq!(machine.mem.read_u32(instance).unwrap(), binding.trampoline, "isa is the class");
+    assert!(instance != 0 && instance != binding, "alloc produced an object");
+    assert_eq!(machine.mem.read_u32(instance).unwrap(), binding, "isa is the class");
 }

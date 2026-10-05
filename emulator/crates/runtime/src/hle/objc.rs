@@ -985,7 +985,7 @@ fn dispatch_host_method(hle: &mut Hle<'_>, class_name: &str, receiver: u32, name
     // Methods the guest installed against one of our class objects win.
     let isa = read_isa(hle, receiver);
     for probe in [receiver, isa] {
-        if let Some(&imp) = hle.sys.objc.host_imps.get(&(probe, name.clone())) {
+        if let Some(&imp) = hle.sys.objc.host_imps.get(&(probe, name.to_owned())) {
             return call_method(hle, name, class_name, imp);
         }
     }
