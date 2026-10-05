@@ -1,770 +1,598 @@
 package com.simpsonsswift.emulator;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.DialogInterface;
 import android.content.Intent;
-import android.content.res.ColorStateList;
-import android.graphics.Color;
-import android.graphics.Typeface;
+import android.content.res.AssetManager;
+import android.database.Cursor;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
-import android.view.Gravity;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.OpenableColumns;
+import android.util.Log;
 import android.view.View;
-import android.webkit.ValueCallback;
-import android.webkit.WebChromeClient;
-import android.webkit.WebResourceRequest;
+import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
-import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
-import org.json.JSONObject;
-
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.ServerSocket;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Small Android front end for the repository's Rust CLI. The Rust executable is
- * packaged in the ABI-specific native-library directory and launched as a child
- * process; the existing local HTTP preview supplies the framebuffer UI.
+ * The whole app: run the bundled emulator, show what it prints, and show its
+ * framebuffer preview.
+ *
+ * <p>There is no Android port of the emulator itself — the APK carries the
+ * ordinary {@code simpsons-emu} command line binary, cross-compiled for the
+ * four Android ABIs, and this activity drives it.
  */
-public final class MainActivity extends Activity {
-    private static final int PICK_IPA_REQUEST = 41;
-    private static final int PICK_WEB_FILE_REQUEST = 42;
-    private static final long MAX_IPA_BYTES = 512L * 1024L * 1024L;
-    private static final int MAX_CONSOLE_CHARS = 24_000;
+public class MainActivity extends Activity implements EmulatorSession.Listener {
 
-    private static final int COLOR_BACKGROUND = Color.rgb(16, 18, 26);
-    private static final int COLOR_PANEL = Color.rgb(25, 29, 41);
-    private static final int COLOR_TEXT = Color.rgb(232, 234, 242);
-    private static final int COLOR_MUTED = Color.rgb(165, 171, 190);
-    private static final int COLOR_ACCENT = Color.rgb(244, 197, 66);
+    private static final String TAG = "SimpsonsEmu";
 
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private volatile Process emulatorProcess;
-    private volatile boolean stopRequested;
+    private static final int REQUEST_IPA = 4711;
 
-    private File gamesRoot;
-    private Uri selectedIpaUri;
-    private ImportedGame importedGame;
-    private ValueCallback<Uri[]> webFileCallback;
-    private boolean busy;
-    private boolean startingEmulator;
+    /**
+     * {@code adb shell am start -n com.simpsonsswift.emulator/.MainActivity --ez autostart_demo true}
+     * boots the demo image without anyone tapping anything; the workflow's
+     * smoke test uses it to prove the packaged binary really runs.
+     */
+    private static final String EXTRA_AUTOSTART_DEMO = "autostart_demo";
 
-    private Button chooseButton;
+    /** Name of the synthetic ARMv7 Mach-O that ships with the APK. */
+    private static final String DEMO_ASSET = "demo-armv7";
+
+    /** Keep the log view bounded; the emulator can be chatty. */
+    private static final int LOG_LIMIT = 192 * 1024;
+
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final ExecutorService background = Executors.newSingleThreadExecutor();
+    private final StringBuilder log = new StringBuilder();
+
+    private TextView statusView;
+    private TextView logView;
+    private ScrollView logScroll;
+    private WebView webView;
+    private Button playButton;
+    private Button demoButton;
     private Button importButton;
-    private Button refreshButton;
-    private Button runButton;
     private Button stopButton;
-    private TextView selectedFileText;
-    private TextView libraryText;
-    private TextView statusText;
-    private TextView consoleText;
-    private ScrollView pageScroller;
-    private ScrollView consoleScroll;
-    private WebView preview;
+    private Button toggleButton;
+
+    private EmulatorSession session;
+    private GameLibrary.Game game;
+    private File demoImage;
+    private boolean previewVisible;
+    private boolean autostartDemo;
 
     @Override
-    protected void onCreate(Bundle state) {
-        super.onCreate(state);
-        getWindow().setStatusBarColor(COLOR_BACKGROUND);
-        getWindow().setNavigationBarColor(COLOR_BACKGROUND);
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
 
-        gamesRoot = new File(getFilesDir(), "games");
-        buildUi();
-        refreshLibrary();
-    }
+        statusView = findViewById(R.id.status);
+        logView = findViewById(R.id.log);
+        logScroll = findViewById(R.id.log_scroll);
+        webView = findViewById(R.id.web);
+        playButton = findViewById(R.id.play);
+        demoButton = findViewById(R.id.demo);
+        importButton = findViewById(R.id.import_ipa);
+        stopButton = findViewById(R.id.stop);
+        toggleButton = findViewById(R.id.toggle);
 
-    private void buildUi() {
-        pageScroller = new ScrollView(this);
-        pageScroller.setFillViewport(true);
-        pageScroller.setBackgroundColor(COLOR_BACKGROUND);
-        if (Build.VERSION.SDK_INT >= 35) {
-            // Android 15 enforces edge-to-edge for targetSdk 35 apps. Keep the
-            // scrollable content clear of the system status/navigation bars.
-            pageScroller.setOnApplyWindowInsetsListener((view, insets) -> {
-                view.setPadding(0, insets.getSystemWindowInsetTop(), 0, insets.getSystemWindowInsetBottom());
-                return insets;
-            });
-        }
+        configureWebView();
 
-        LinearLayout page = new LinearLayout(this);
-        page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(dp(20), dp(22), dp(20), dp(28));
-        pageScroller.addView(page, new ScrollView.LayoutParams(
-                ScrollView.LayoutParams.MATCH_PARENT,
-                ScrollView.LayoutParams.WRAP_CONTENT));
-        setContentView(pageScroller);
-
-        TextView brand = makeText("SIMPSONSSWIFT", 13, COLOR_ACCENT, true);
-        brand.setLetterSpacing(0.12f);
-        page.addView(brand, matchWrap());
-
-        TextView title = makeText("The Simpsons Arcade", 25, COLOR_TEXT, true);
-        LinearLayout.LayoutParams titleParams = matchWrap();
-        titleParams.topMargin = dp(5);
-        page.addView(title, titleParams);
-
-        TextView intro = makeText(
-                "This APK contains the emulator, not the game. Select a decrypted IPA you obtained yourself; it is imported into this app's private storage and is never uploaded. The game boot path is still experimental.",
-                14, COLOR_MUTED, false);
-        intro.setLineSpacing(dp(3), 1.0f);
-        LinearLayout.LayoutParams introParams = matchWrap();
-        introParams.topMargin = dp(8);
-        introParams.bottomMargin = dp(18);
-        page.addView(intro, introParams);
-
-        chooseButton = makeButton("Choose decrypted IPA", true);
-        chooseButton.setOnClickListener(view -> launchPicker(PICK_IPA_REQUEST));
-        page.addView(chooseButton, matchWrap());
-
-        selectedFileText = makeText("No IPA selected", 13, COLOR_MUTED, false);
-        LinearLayout.LayoutParams fileParams = matchWrap();
-        fileParams.topMargin = dp(7);
-        fileParams.bottomMargin = dp(8);
-        page.addView(selectedFileText, fileParams);
-
-        importButton = makeButton("Import game", false);
-        importButton.setOnClickListener(view -> importSelectedIpa());
-        page.addView(importButton, matchWrap());
-
-        LinearLayout libraryRow = new LinearLayout(this);
-        libraryRow.setOrientation(LinearLayout.HORIZONTAL);
-        libraryRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams libraryRowParams = matchWrap();
-        libraryRowParams.topMargin = dp(14);
-        page.addView(libraryRow, libraryRowParams);
-
-        TextView libraryHeader = makeText("GAME LIBRARY", 12, COLOR_ACCENT, true);
-        libraryHeader.setLetterSpacing(0.08f);
-        libraryRow.addView(libraryHeader, new LinearLayout.LayoutParams(0, dp(42), 1.0f));
-
-        refreshButton = makeButton("Refresh", false);
-        refreshButton.setOnClickListener(view -> refreshLibrary());
-        libraryRow.addView(refreshButton, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, dp(42)));
-
-        libraryText = makeText("Looking for imported games…", 13, COLOR_TEXT, false);
-        libraryText.setBackgroundColor(COLOR_PANEL);
-        libraryText.setPadding(dp(12), dp(10), dp(12), dp(10));
-        page.addView(libraryText, matchWrap());
-
-        LinearLayout controls = new LinearLayout(this);
-        controls.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams controlsParams = matchWrap();
-        controlsParams.topMargin = dp(12);
-        page.addView(controls, controlsParams);
-
-        runButton = makeButton("Start emulator", true);
-        runButton.setOnClickListener(view -> startEmulator());
-        LinearLayout.LayoutParams runParams = new LinearLayout.LayoutParams(0, dp(48), 1.0f);
-        runParams.rightMargin = dp(6);
-        controls.addView(runButton, runParams);
-
-        stopButton = makeButton("Stop", false);
-        stopButton.setOnClickListener(view -> stopEmulator());
-        LinearLayout.LayoutParams stopParams = new LinearLayout.LayoutParams(0, dp(48), 1.0f);
-        stopParams.leftMargin = dp(6);
-        controls.addView(stopButton, stopParams);
-
-        statusText = makeText("Choose a decrypted IPA to get started.", 13, COLOR_MUTED, false);
-        statusText.setBackgroundColor(COLOR_PANEL);
-        statusText.setPadding(dp(12), dp(10), dp(12), dp(10));
-        LinearLayout.LayoutParams statusParams = matchWrap();
-        statusParams.topMargin = dp(10);
-        page.addView(statusText, statusParams);
-
-        preview = new WebView(this);
-        preview.setBackgroundColor(Color.BLACK);
-        preview.getSettings().setJavaScriptEnabled(true);
-        preview.getSettings().setDomStorageEnabled(false);
-        preview.getSettings().setAllowFileAccess(false);
-        preview.setWebViewClient(new WebViewClient() {
+        playButton.setOnClickListener(new View.OnClickListener() {
             @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                Uri uri = request.getUrl();
-                String host = uri == null ? null : uri.getHost();
-                return !("127.0.0.1".equals(host) || "localhost".equals(host));
-            }
-
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                Uri uri = Uri.parse(url);
-                String host = uri.getHost();
-                return !("127.0.0.1".equals(host) || "localhost".equals(host));
+            public void onClick(View view) {
+                playGame();
             }
         });
-        preview.setWebChromeClient(new WebChromeClient() {
+        demoButton.setOnClickListener(new View.OnClickListener() {
             @Override
-            public boolean onShowFileChooser(
-                    WebView webView,
-                    ValueCallback<Uri[]> filePathCallback,
-                    FileChooserParams fileChooserParams) {
-                if (webFileCallback != null) {
-                    webFileCallback.onReceiveValue(null);
-                }
-                webFileCallback = filePathCallback;
-                if (!launchPicker(PICK_WEB_FILE_REQUEST)) {
-                    webFileCallback = null;
-                    filePathCallback.onReceiveValue(null);
-                    return false;
-                }
-                return true;
+            public void onClick(View view) {
+                runDemo();
             }
         });
-        preview.setVisibility(View.GONE);
-        LinearLayout.LayoutParams previewParams = matchWrap();
-        previewParams.topMargin = dp(14);
-        previewParams.height = dp(420);
-        page.addView(preview, previewParams);
+        importButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                pickArchive();
+            }
+        });
+        stopButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                stopSession(true);
+            }
+        });
+        toggleButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                showPreview(!previewVisible);
+            }
+        });
 
-        TextView consoleHeader = makeText("EMULATOR OUTPUT", 12, COLOR_ACCENT, true);
-        consoleHeader.setLetterSpacing(0.08f);
-        LinearLayout.LayoutParams consoleHeaderParams = matchWrap();
-        consoleHeaderParams.topMargin = dp(16);
-        consoleHeaderParams.bottomMargin = dp(7);
-        page.addView(consoleHeader, consoleHeaderParams);
-
-        consoleScroll = new ScrollView(this);
-        consoleScroll.setBackgroundColor(COLOR_PANEL);
-        consoleText = makeText(
-                "The emulator log and any import or startup errors will appear here.",
-                12, COLOR_TEXT, false);
-        consoleText.setTypeface(Typeface.MONOSPACE);
-        consoleText.setTextIsSelectable(true);
-        consoleText.setPadding(dp(12), dp(12), dp(12), dp(12));
-        consoleScroll.addView(consoleText, new ScrollView.LayoutParams(
-                ScrollView.LayoutParams.MATCH_PARENT,
-                ScrollView.LayoutParams.WRAP_CONTENT));
-        LinearLayout.LayoutParams consoleParams = matchWrap();
-        consoleParams.height = dp(210);
-        page.addView(consoleScroll, consoleParams);
-
-        updateButtons();
+        autostartDemo = getIntent() != null && getIntent().getBooleanExtra(EXTRA_AUTOSTART_DEMO, false);
+        stopButton.setEnabled(false);
+        showPreview(false);
+        append("Simpsons Arcade — ARMv7 iOS emulator");
+        append("");
+        prepare();
     }
 
-    private TextView makeText(String text, float sizeSp, int color, boolean bold) {
-        TextView view = new TextView(this);
-        view.setText(text);
-        view.setTextSize(sizeSp);
-        view.setTextColor(color);
-        if (bold) {
-            view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+    @Override
+    protected void onDestroy() {
+        if (isFinishing()) {
+            stopSession(false);
         }
-        return view;
+        background.shutdownNow();
+        super.onDestroy();
     }
 
-    private Button makeButton(String text, boolean primary) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setAllCaps(false);
-        button.setTextSize(14);
-        button.setTextColor(primary ? COLOR_BACKGROUND : COLOR_TEXT);
-        button.setBackgroundTintList(ColorStateList.valueOf(
-                primary ? COLOR_ACCENT : Color.rgb(48, 55, 73)));
-        return button;
+    // -----------------------------------------------------------------------
+    // start-up
+    // -----------------------------------------------------------------------
+
+    /** Lay out private storage, unpack the demo image, read the library. */
+    private void prepare() {
+        background.execute(new Runnable() {
+            @Override
+            public void run() {
+                final boolean haveBinary = NativeTool.isAvailable(MainActivity.this);
+                File games = NativeTool.gamesDir(MainActivity.this);
+                if (!games.isDirectory() && !games.mkdirs()) {
+                    post("[app] cannot create " + games);
+                }
+                File demo = null;
+                try {
+                    demo = unpackDemo();
+                } catch (IOException missing) {
+                    post("[app] no demo image in this build: " + missing.getMessage());
+                }
+                final File unpacked = demo;
+                final List<GameLibrary.Game> library = GameLibrary.scan(games);
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        demoImage = unpacked;
+                        game = library.isEmpty() ? null : library.get(0);
+                        if (!haveBinary) {
+                            append("[app] this APK has no emulator binary for this device's ABI (" + abi() + ").");
+                            append("[app] install the universal APK from the release page.");
+                            playButton.setEnabled(false);
+                            demoButton.setEnabled(false);
+                            importButton.setEnabled(false);
+                            setStatus("no native binary for " + abi());
+                            return;
+                        }
+                        demoButton.setEnabled(unpacked != null);
+                        describeLibrary(library);
+                        refreshStatus();
+                        if (autostartDemo && unpacked != null) {
+                            autostartDemo = false;
+                            runDemo();
+                        }
+                    }
+                });
+            }
+        });
     }
 
-    private LinearLayout.LayoutParams matchWrap() {
-        return new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
+    private void describeLibrary(List<GameLibrary.Game> games) {
+        if (games.isEmpty()) {
+            append("No game imported yet.  This emulator ships no game and downloads nothing:");
+            append("tap \u201cImport .ipa\u201d and pick your own decrypted copy of");
+            append("The Simpsons Arcade v1.1.43, or tap \u201cDemo\u201d to boot a synthetic");
+            append("ARMv7 Mach-O and watch the loader, the interpreter and the HLE work.");
+        } else {
+            append("Game library:");
+            for (GameLibrary.Game entry : games) {
+                append("  " + entry.label + "  (" + entry.bundleDir.getName() + ")");
+            }
+        }
+        append("");
     }
 
-    private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
+    /** Copy the bundled demo image out of the APK so the emulator can read it. */
+    private File unpackDemo() throws IOException {
+        File destination = new File(getFilesDir(), DEMO_ASSET);
+        AssetManager assets = getAssets();
+        InputStream input = assets.open(DEMO_ASSET);
+        OutputStream output = null;
+        try {
+            output = new FileOutputStream(destination);
+            copy(input, output);
+        } finally {
+            closeQuietly(input);
+            closeQuietly(output);
+        }
+        return destination;
     }
 
-    private boolean launchPicker(int requestCode) {
+    // -----------------------------------------------------------------------
+    // running
+    // -----------------------------------------------------------------------
+
+    private void playGame() {
+        if (game == null) {
+            toast("Import an .ipa first");
+            showPreview(false);
+            return;
+        }
+        List<String> arguments = new ArrayList<>(Arrays.asList(
+                "run", game.executable.getAbsolutePath(),
+                "--bundle", game.bundleDir.getAbsolutePath(),
+                "--tolerate-undefined",
+                "--max-insns", "100000000000"));
+        start(arguments, game.label);
+    }
+
+    private void runDemo() {
+        if (demoImage == null || !demoImage.isFile()) {
+            toast("The demo image is missing from this build");
+            return;
+        }
+        List<String> arguments = new ArrayList<>(Arrays.asList(
+                "run", demoImage.getAbsolutePath(),
+                "--trace",
+                "--stats",
+                "--verbose"));
+        start(arguments, "demo (synthetic ARMv7 Mach-O)");
+    }
+
+    /** Start `simpsons-emu run ... --serve <port> --bind 127.0.0.1`. */
+    private void start(List<String> arguments, final String what) {
+        stopSession(false);
+        final int port = EmulatorSession.freePort();
+        arguments.add("--serve");
+        arguments.add(Integer.toString(port));
+        // The demo guest exits in milliseconds; without this the preview would
+        // be gone before it could be shown.
+        arguments.add("--keep-serving");
+        // Loopback only: the preview never leaves the phone.
+        arguments.add("--bind");
+        arguments.add("127.0.0.1");
+
+        append("");
+        append("$ simpsons-emu " + join(arguments));
+        setStatus("starting " + what + "\u2026");
+        showPreview(false);
+        try {
+            session = EmulatorSession.start(this, arguments, port, this);
+            playButton.setEnabled(false);
+            demoButton.setEnabled(false);
+            stopButton.setEnabled(true);
+        } catch (IOException failed) {
+            append("[app] could not start the emulator: " + failed);
+            setStatus("failed to start");
+        }
+    }
+
+    private void stopSession(boolean announce) {
+        EmulatorSession running = session;
+        session = null;
+        if (running != null && running.isRunning()) {
+            running.stop();
+            if (announce) {
+                append("[app] stopped");
+            }
+        }
+    }
+
+    @Override
+    public void onLine(final String text) {
+        post(text);
+    }
+
+    @Override
+    public void onReady(final int port) {
+        ui.post(new Runnable() {
+            @Override
+            public void run() {
+                append("[app] preview ready on 127.0.0.1:" + port);
+                webView.loadUrl("http://127.0.0.1:" + port + "/");
+                showPreview(true);
+                setStatus("running \u2014 preview on 127.0.0.1:" + port);
+            }
+        });
+    }
+
+    @Override
+    public void onExit(final int code) {
+        ui.post(new Runnable() {
+            @Override
+            public void run() {
+                session = null;
+                playButton.setEnabled(true);
+                demoButton.setEnabled(demoImage != null);
+                stopButton.setEnabled(false);
+                webView.loadUrl("about:blank");
+                showPreview(false);
+                append("[app] emulator exited with status " + code);
+                refreshStatus();
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // importing
+    // -----------------------------------------------------------------------
+
+    private void pickArchive() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
-        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
-                "application/octet-stream", "application/zip", "application/x-ipa"
-        });
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
-                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         try {
-            startActivityForResult(intent, requestCode);
-            return true;
-        } catch (Exception error) {
-            setStatus("Could not open the Android file picker: " + error.getMessage());
-            return false;
+            startActivityForResult(intent, REQUEST_IPA);
+        } catch (RuntimeException noPicker) {
+            toast("No file picker on this device");
         }
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        Uri uri = resultCode == RESULT_OK && data != null ? data.getData() : null;
-
-        if (requestCode == PICK_WEB_FILE_REQUEST) {
-            if (webFileCallback != null) {
-                webFileCallback.onReceiveValue(uri == null ? null : new Uri[]{uri});
-                webFileCallback = null;
-            }
+        if (requestCode != REQUEST_IPA || resultCode != RESULT_OK || data == null || data.getData() == null) {
             return;
         }
-
-        if (requestCode == PICK_IPA_REQUEST && uri != null) {
-            try {
-                getContentResolver().takePersistableUriPermission(
-                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            } catch (SecurityException ignored) {
-                // The selected provider can grant a temporary read permission;
-                // the file is copied as soon as the user taps Import.
-            }
-            selectedIpaUri = uri;
-            String name = uri.getLastPathSegment();
-            selectedFileText.setText("Selected: " + (name == null ? "IPA document" : name));
-            setStatus("Ready to validate and import the selected archive.");
-            updateButtons();
-        }
+        importArchive(data.getData(), false);
     }
 
-    private void importSelectedIpa() {
-        final Uri uri = selectedIpaUri;
-        if (uri == null || busy || isEmulatorRunning()) {
-            return;
-        }
-
-        busy = true;
-        setStatus("Copying and validating the IPA…");
-        appendConsole("Import started. The source IPA is temporary and will be removed after import.");
-        updateButtons();
-
-        worker.execute(() -> {
-            File temporaryIpa = new File(getCacheDir(), "simpsons-selected.ipa");
-            ImportedGame result = null;
-            String failure = null;
-            try {
-                if (temporaryIpa.exists() && !temporaryIpa.delete()) {
-                    throw new IOException("Could not clear the previous temporary IPA copy.");
-                }
-                long copied = copyUriToFile(uri, temporaryIpa);
-                if (copied == 0) {
-                    throw new IOException("The selected file was empty.");
-                }
-
-                File binary = requireEmulatorBinary();
-                Process process = new ProcessBuilder(
-                        binary.getAbsolutePath(),
-                        "import",
-                        temporaryIpa.getAbsolutePath(),
-                        "--dest",
-                        gamesRoot.getAbsolutePath(),
-                        "--force")
-                        .directory(getFilesDir())
-                        .redirectErrorStream(true)
-                        .start();
-                int exitCode = streamOutputAndWait(process);
-                if (exitCode != 0) {
-                    throw new IOException("The importer exited with code " + exitCode + ". See emulator output.");
-                }
-
-                result = findLatestGame(gamesRoot);
-                if (result == null) {
-                    throw new IOException("Import finished, but no usable game manifest was found.");
-                }
-            } catch (Exception error) {
-                failure = error.getMessage() == null ? error.toString() : error.getMessage();
-                appendConsole("Import error: " + failure);
-            } finally {
-                if (temporaryIpa.exists() && !temporaryIpa.delete()) {
-                    appendConsole("Warning: could not remove the temporary IPA from the app cache.");
+    private void importArchive(final Uri uri, final boolean allowOtherApp) {
+        showPreview(false);
+        setStatus("importing\u2026");
+        importButton.setEnabled(false);
+        background.execute(new Runnable() {
+            @Override
+            public void run() {
+                File staged = null;
+                try {
+                    staged = stage(uri);
+                    post("");
+                    post("$ simpsons-emu import " + staged.getName() + (allowOtherApp ? " --allow-other-app" : ""));
+                    List<String> arguments = new ArrayList<>(Arrays.asList(
+                            "import", staged.getAbsolutePath(),
+                            "--dest", NativeTool.gamesDir(MainActivity.this).getAbsolutePath(),
+                            "--force"));
+                    if (allowOtherApp) {
+                        arguments.add("--allow-other-app");
+                    }
+                    final StringBuilder output = new StringBuilder();
+                    int code = NativeTool.run(MainActivity.this, arguments, new NativeTool.Output() {
+                        @Override
+                        public void line(String text) {
+                            output.append(text).append('\n');
+                            post(text);
+                        }
+                    });
+                    final boolean refusedApp = code != 0 && output.indexOf("--allow-other-app") >= 0;
+                    finishImport(code, refusedApp, uri);
+                } catch (IOException failed) {
+                    post("[app] import failed: " + failed);
+                    finishImport(-1, false, uri);
+                } finally {
+                    if (staged != null && !staged.delete()) {
+                        post("[app] note: could not delete the staged copy at " + staged);
+                    }
                 }
             }
-
-            final ImportedGame imported = result;
-            final String errorMessage = failure;
-            runOnUiThread(() -> {
-                busy = false;
-                if (imported != null) {
-                    importedGame = imported;
-                    selectedIpaUri = null;
-                    selectedFileText.setText("IPA imported; the original archive was not retained.");
-                    libraryText.setText(imported.label + "\n" + imported.executable.getParent());
-                    setStatus("Imported " + imported.label + ". Start the emulator when ready.");
-                } else {
-                    setStatus("Import failed: " + errorMessage);
-                }
-                updateButtons();
-            });
         });
     }
 
-    private long copyUriToFile(Uri uri, File target) throws IOException {
-        InputStream opened = getContentResolver().openInputStream(uri);
-        if (opened == null) {
-            throw new IOException("Android could not read the selected document.");
-        }
-        long total = 0;
-        byte[] buffer = new byte[64 * 1024];
-        try (InputStream input = new BufferedInputStream(opened);
-             OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
-            int count;
-            while ((count = input.read(buffer)) != -1) {
-                total += count;
-                if (total > MAX_IPA_BYTES) {
-                    throw new IOException("IPA is larger than this app's 512 MiB import limit.");
+    private void finishImport(final int code, final boolean refusedApp, final Uri uri) {
+        final List<GameLibrary.Game> games = GameLibrary.scan(NativeTool.gamesDir(this));
+        ui.post(new Runnable() {
+            @Override
+            public void run() {
+                importButton.setEnabled(true);
+                game = games.isEmpty() ? null : games.get(0);
+                refreshStatus();
+                if (code == 0) {
+                    append("[app] imported \u2014 tap Play");
+                    toast("Imported");
+                } else if (refusedApp) {
+                    askAboutOtherApp(uri);
                 }
-                output.write(buffer, 0, count);
+            }
+        });
+    }
+
+    private void askAboutOtherApp(final Uri uri) {
+        new AlertDialog.Builder(this)
+                .setTitle("Not The Simpsons Arcade")
+                .setMessage("That archive is a valid iOS app, but not the game this emulator targets "
+                        + "(v1.1.43).  Import it anyway?  The HLE surface is written for that release, "
+                        + "so anything else is unlikely to boot.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Import anyway", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        importArchive(uri, true);
+                    }
+                })
+                .show();
+    }
+
+    /** Copy the picked document into the cache so the CLI can open it by path. */
+    private File stage(Uri uri) throws IOException {
+        File directory = new File(getCacheDir(), "incoming");
+        if (!directory.isDirectory() && !directory.mkdirs()) {
+            throw new IOException("cannot create " + directory);
+        }
+        File destination = new File(directory, fileName(uri));
+        InputStream input = getContentResolver().openInputStream(uri);
+        if (input == null) {
+            throw new IOException("the file picker returned nothing readable");
+        }
+        OutputStream output = null;
+        try {
+            output = new FileOutputStream(destination);
+            long bytes = copy(input, output);
+            post("[app] staged " + destination.getName() + " (" + bytes + " bytes)");
+        } finally {
+            closeQuietly(input);
+            closeQuietly(output);
+        }
+        return destination;
+    }
+
+    private String fileName(Uri uri) {
+        String name = null;
+        Cursor cursor = null;
+        try {
+            cursor = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null);
+            if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) {
+                name = cursor.getString(0);
+            }
+        } catch (RuntimeException unreadable) {
+            name = null;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
             }
         }
+        if (name == null || name.trim().isEmpty()) {
+            name = "import.ipa";
+        }
+        name = name.replace('/', '_').replace('\\', '_');
+        return name.length() > 96 ? name.substring(name.length() - 96) : name;
+    }
+
+    // -----------------------------------------------------------------------
+    // plumbing
+    // -----------------------------------------------------------------------
+
+    private void configureWebView() {
+        WebSettings settings = webView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
+        settings.setUseWideViewPort(true);
+        settings.setLoadWithOverviewMode(true);
+        settings.setBuiltInZoomControls(true);
+        settings.setDisplayZoomControls(false);
+        webView.setBackgroundColor(0xFF10121A);
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (!"about:blank".equals(url)) {
+                    append("[app] preview page loaded: " + url);
+                }
+            }
+        });
+    }
+
+    private void showPreview(boolean preview) {
+        previewVisible = preview;
+        webView.setVisibility(preview ? View.VISIBLE : View.GONE);
+        logScroll.setVisibility(preview ? View.GONE : View.VISIBLE);
+        toggleButton.setText(preview ? R.string.log : R.string.preview);
+    }
+
+    private void refreshStatus() {
+        if (session != null && session.isRunning()) {
+            return;
+        }
+        if (game != null) {
+            setStatus("ready \u2014 " + game.label);
+        } else {
+            setStatus("ready \u2014 no game imported");
+        }
+    }
+
+    private void setStatus(String text) {
+        statusView.setText(text);
+    }
+
+    /** Append a line from a background thread. */
+    private void post(final String text) {
+        ui.post(new Runnable() {
+            @Override
+            public void run() {
+                append(text);
+            }
+        });
+    }
+
+    private void append(String text) {
+        Log.i(TAG, text);
+        log.append(text).append('\n');
+        if (log.length() > LOG_LIMIT) {
+            log.delete(0, log.length() - LOG_LIMIT);
+        }
+        logView.setText(log.toString());
+        logScroll.post(new Runnable() {
+            @Override
+            public void run() {
+                logScroll.fullScroll(View.FOCUS_DOWN);
+            }
+        });
+    }
+
+    private void toast(String text) {
+        Toast.makeText(this, text, Toast.LENGTH_SHORT).show();
+    }
+
+    private String abi() {
+        String[] abis = android.os.Build.SUPPORTED_ABIS;
+        return abis != null && abis.length > 0 ? abis[0] : "unknown";
+    }
+
+    private static String join(List<String> parts) {
+        StringBuilder text = new StringBuilder();
+        for (String part : parts) {
+            if (text.length() > 0) {
+                text.append(' ');
+            }
+            text.append(part.indexOf(' ') >= 0 ? "\"" + part + "\"" : part);
+        }
+        return text.toString();
+    }
+
+    private static long copy(InputStream input, OutputStream output) throws IOException {
+        byte[] buffer = new byte[64 * 1024];
+        long total = 0;
+        int read;
+        while ((read = input.read(buffer)) > 0) {
+            output.write(buffer, 0, read);
+            total += read;
+        }
+        output.flush();
         return total;
     }
 
-    private void refreshLibrary() {
-        if (busy || isEmulatorRunning()) {
-            return;
-        }
-        busy = true;
-        libraryText.setText("Scanning private game library…");
-        updateButtons();
-        worker.execute(() -> {
-            ImportedGame latest = findLatestGame(gamesRoot);
-            runOnUiThread(() -> {
-                importedGame = latest;
-                busy = false;
-                if (latest == null) {
-                    libraryText.setText("No imported game yet. Choose your own decrypted Simpsons Arcade IPA above.");
-                    setStatus("Choose a decrypted IPA to get started.");
-                } else {
-                    libraryText.setText(latest.label + "\n" + latest.executable.getParent());
-                    setStatus("Game ready. Start the emulator to open its live preview.");
-                }
-                updateButtons();
-            });
-        });
-    }
-
-    private ImportedGame findLatestGame(File root) {
-        File[] children = root.listFiles();
-        if (children == null) {
-            return null;
-        }
-
-        ImportedGame latest = null;
-        for (File directory : children) {
-            if (!directory.isDirectory()) {
-                continue;
-            }
-            File manifest = new File(directory, "import.json");
-            if (!manifest.isFile()) {
-                continue;
-            }
+    private static void closeQuietly(InputStream stream) {
+        if (stream != null) {
             try {
-                String jsonText = readUtf8(manifest);
-                JSONObject json = new JSONObject(jsonText);
-                String appBundle = safeChildName(json.optString("app_bundle", ""));
-                String executableName = safeChildName(json.optString("executable", ""));
-                if (appBundle == null || executableName == null) {
-                    continue;
-                }
-                File bundle = new File(directory, appBundle);
-                File executable = new File(bundle, executableName);
-                String rootPath = directory.getCanonicalPath() + File.separator;
-                if (!executable.getCanonicalPath().startsWith(rootPath) || !executable.isFile()) {
-                    continue;
-                }
-
-                String title = json.optString("display_name", "");
-                if (title.isEmpty()) {
-                    title = json.optString("title", "Imported game");
-                }
-                String version = json.optString("version", "");
-                String label = version.isEmpty() ? title : title + " " + version;
-                long importedAt = json.optLong("imported_unix", directory.lastModified() / 1000L);
-                ImportedGame candidate = new ImportedGame(bundle, executable, label, importedAt);
-                if (latest == null || candidate.importedAt >= latest.importedAt) {
-                    latest = candidate;
-                }
-            } catch (Exception ignored) {
-                // Skip damaged or hand-edited manifests; the Rust importer will
-                // report detailed errors if the user imports the IPA again.
+                stream.close();
+            } catch (IOException ignored) {
+                // Nothing useful to do.
             }
         }
-        return latest;
     }
 
-    private String safeChildName(String name) {
-        if (name == null || name.isEmpty() || ".".equals(name) || "..".equals(name)
-                || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) {
-            return null;
-        }
-        return name;
-    }
-
-    private String readUtf8(File file) throws IOException {
-        StringBuilder result = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                new FileInputStream(file), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                result.append(line).append('\n');
-            }
-        }
-        return result.toString();
-    }
-
-    private void startEmulator() {
-        final ImportedGame game = importedGame;
-        if (game == null || busy || isEmulatorRunning()) {
-            return;
-        }
-
-        startingEmulator = true;
-        stopRequested = false;
-        consoleText.setText("");
-        setStatus("Starting the Rust emulator…");
-        updateButtons();
-
-        worker.execute(() -> {
-            String outcome;
+    private static void closeQuietly(OutputStream stream) {
+        if (stream != null) {
             try {
-                File binary = requireEmulatorBinary();
-                int port = findAvailablePort();
-                ProcessBuilder builder = new ProcessBuilder(
-                        binary.getAbsolutePath(),
-                        "run",
-                        game.executable.getAbsolutePath(),
-                        "--bundle",
-                        game.bundle.getAbsolutePath(),
-                        "--dest",
-                        gamesRoot.getAbsolutePath(),
-                        "--serve",
-                        Integer.toString(port),
-                        "--stats")
-                        .directory(gamesRoot)
-                        .redirectErrorStream(true);
-                Map<String, String> environment = builder.environment();
-                environment.put("HOME", getFilesDir().getAbsolutePath());
-                environment.put("TMPDIR", getCacheDir().getAbsolutePath());
-                // The app's embedded WebView is the only client. Do not expose
-                // the unauthenticated preview/import server to the Wi-Fi LAN.
-                environment.put("SIMPSONS_EMU_SERVE_HOST", "127.0.0.1");
-
-                Process process = builder.start();
-                emulatorProcess = process;
-                runOnUiThread(this::updateButtons);
-                if (stopRequested) {
-                    process.destroy();
-                }
-
-                boolean previewReady = waitForPreview(process, port);
-                if (previewReady) {
-                    String previewUrl = "http://127.0.0.1:" + port + "/";
-                    runOnUiThread(() -> {
-                        preview.setVisibility(View.VISIBLE);
-                        preview.loadUrl(previewUrl);
-                        statusText.setText("Emulator running. The live framebuffer and guest log are shown below.");
-                        pageScrollToPreview();
-                    });
-                } else if (!stopRequested) {
-                    appendConsole("Preview server did not become ready; check the startup output below.");
-                }
-
-                int exitCode = streamOutputAndWait(process);
-                outcome = exitCode == 0
-                        ? "Emulator exited. See output for its stop reason."
-                        : "Emulator stopped with exit code " + exitCode + ". See output for details.";
-            } catch (Exception error) {
-                outcome = "Could not start the emulator: "
-                        + (error.getMessage() == null ? error.toString() : error.getMessage());
-                appendConsole(outcome);
-            } finally {
-                emulatorProcess = null;
-                startingEmulator = false;
-                stopRequested = false;
+                stream.close();
+            } catch (IOException ignored) {
+                // Nothing useful to do.
             }
-
-            final String finalOutcome = outcome;
-            runOnUiThread(() -> {
-                preview.stopLoading();
-                preview.setVisibility(View.GONE);
-                setStatus(finalOutcome);
-                updateButtons();
-            });
-        });
-    }
-
-    private void pageScrollToPreview() {
-        if (pageScroller != null && preview != null) {
-            pageScroller.post(() -> pageScroller.smoothScrollTo(0, preview.getTop()));
-            preview.requestFocus();
-        }
-    }
-
-    private void stopEmulator() {
-        if (!isEmulatorRunning()) {
-            return;
-        }
-        stopRequested = true;
-        Process process = emulatorProcess;
-        if (process != null) {
-            process.destroy();
-        }
-        setStatus("Stopping emulator…");
-        appendConsole("Stop requested.");
-        updateButtons();
-    }
-
-    private boolean isEmulatorRunning() {
-        return startingEmulator || emulatorProcess != null;
-    }
-
-    private File requireEmulatorBinary() throws IOException {
-        String libraryDir = getApplicationInfo().nativeLibraryDir;
-        File binary = new File(libraryDir, "libsimpsons-emu.so");
-        if (!binary.isFile()) {
-            throw new IOException("The APK has no Rust emulator for this device. Install the universal APK built by android.yml.");
-        }
-        if (!binary.canExecute()) {
-            throw new IOException("Android did not mark the packaged emulator executable. Reinstall the APK.");
-        }
-        return binary;
-    }
-
-    private int findAvailablePort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0)) {
-            return socket.getLocalPort();
-        }
-    }
-
-    private boolean waitForPreview(Process process, int port) {
-        long deadline = System.currentTimeMillis() + 12_000L;
-        String address = "http://127.0.0.1:" + port + "/stats";
-        while (System.currentTimeMillis() < deadline && processIsRunning(process)) {
-            HttpURLConnection connection = null;
-            try {
-                connection = (HttpURLConnection) new URL(address).openConnection();
-                connection.setConnectTimeout(500);
-                connection.setReadTimeout(500);
-                connection.setUseCaches(false);
-                if (connection.getResponseCode() == HttpURLConnection.HTTP_OK) {
-                    InputStream response = connection.getInputStream();
-                    response.close();
-                    return true;
-                }
-            } catch (Exception ignored) {
-                // The listener may not be up yet; retry while the child runs.
-            } finally {
-                if (connection != null) {
-                    connection.disconnect();
-                }
-            }
-            try {
-                Thread.sleep(250L);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
-        }
-        return false;
-    }
-
-    private boolean processIsRunning(Process process) {
-        try {
-            process.exitValue();
-            return false;
-        } catch (IllegalThreadStateException stillRunning) {
-            return true;
-        }
-    }
-
-    private int streamOutputAndWait(Process process) throws IOException, InterruptedException {
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                process.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                appendConsole(line);
-            }
-        }
-        return process.waitFor();
-    }
-
-    private void appendConsole(String line) {
-        runOnUiThread(() -> {
-            if (consoleText == null) {
-                return;
-            }
-            String current = consoleText.getText().toString();
-            String addition = line + "\n";
-            int excess = current.length() + addition.length() - MAX_CONSOLE_CHARS;
-            if (excess > 0) {
-                current = current.substring(Math.min(excess, current.length()));
-            }
-            consoleText.setText(current + addition);
-            if (consoleScroll != null) {
-                consoleScroll.post(() -> consoleScroll.fullScroll(View.FOCUS_DOWN));
-            }
-        });
-    }
-
-    private void setStatus(String message) {
-        if (statusText != null) {
-            statusText.setText(message);
-        }
-    }
-
-    private void updateButtons() {
-        if (chooseButton == null) {
-            return;
-        }
-        boolean running = isEmulatorRunning();
-        chooseButton.setEnabled(!busy && !running);
-        importButton.setEnabled(!busy && !running && selectedIpaUri != null);
-        refreshButton.setEnabled(!busy && !running);
-        runButton.setEnabled(!busy && !running && importedGame != null);
-        stopButton.setEnabled(running);
-    }
-
-    @Override
-    protected void onDestroy() {
-        Process process = emulatorProcess;
-        if (process != null) {
-            process.destroy();
-        }
-        if (webFileCallback != null) {
-            webFileCallback.onReceiveValue(null);
-            webFileCallback = null;
-        }
-        worker.shutdownNow();
-        if (preview != null) {
-            preview.stopLoading();
-            preview.destroy();
-        }
-        super.onDestroy();
-    }
-
-    private static final class ImportedGame {
-        final File bundle;
-        final File executable;
-        final String label;
-        final long importedAt;
-
-        ImportedGame(File bundle, File executable, String label, long importedAt) {
-            this.bundle = bundle;
-            this.executable = executable;
-            this.label = label;
-            this.importedAt = importedAt;
         }
     }
 }

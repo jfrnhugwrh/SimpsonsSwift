@@ -1,0 +1,163 @@
+# Deletes old workflow runs every three hours.
+#
+# A deleted run takes its logs and its artifacts with it, so the APK is kept
+# where this cannot reach it: android.yml attaches every build to the
+# `android-latest` release, and releases are never touched here.
+#
+# Defaults: every completed run except this one is deleted.  Dispatch it by hand
+# to keep the newest few, to protect recent runs, or to see what it would do
+# without deleting anything.
+#
+# Note: GitHub only runs `schedule` from the repository's **default branch**, so
+# this file has to be on `main` before the timer starts.  GitHub also disables
+# scheduled workflows after 60 days without repository activity, and may delay a
+# scheduled run when the fleet is busy.
+
+name: Purge workflow runs
+
+on:
+  schedule:
+    # 00:00, 03:00, 06:00 … UTC
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      keep_per_workflow:
+        description: 'Newest runs of each workflow to keep'
+        required: false
+        default: '0'
+      protect_minutes:
+        description: 'Never delete runs younger than this many minutes'
+        required: false
+        default: '0'
+      limit:
+        description: 'Most runs to delete in one go'
+        required: false
+        default: '300'
+      dry_run:
+        description: 'List what would be deleted, delete nothing'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: purge-workflow-runs
+  cancel-in-progress: false
+
+jobs:
+  purge:
+    name: purge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete previous workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ inputs.keep_per_workflow || '0' }}
+          PROTECT_MINUTES: ${{ inputs.protect_minutes || '0' }}
+          LIMIT: ${{ inputs.limit || '300' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+
+          cutoff="$(date -u -d "@$(( $(date -u +%s) - PROTECT_MINUTES * 60 ))" +%Y-%m-%dT%H:%M:%SZ)"
+          echo "repository      $GITHUB_REPOSITORY"
+          echo "this run        $GITHUB_RUN_ID (never deleted)"
+          echo "keep per flow   $KEEP"
+          echo "protect after   $cutoff"
+          echo "limit           $LIMIT"
+          echo "dry run         $DRY_RUN"
+          echo
+
+          # id, workflow, name, status, created_at, run number — one run a line.
+          gh api --paginate \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" \
+            --jq '.workflow_runs[] | [.id, .workflow_id, (.name // "workflow"), .status, .created_at, .run_number, (.conclusion // "")] | @tsv' \
+            > runs.tsv
+          total="$(wc -l < runs.tsv | tr -d ' ')"
+          echo "$total run(s) in this repository"
+
+          if [ "$total" -eq 0 ]; then
+            echo "nothing to do" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Newest first within each workflow, so "keep the newest N" is a head.
+          sort -t"$(printf '\t')" -k2,2 -k5,5r runs.tsv > runs.tsv.sorted
+
+          awk -F'\t' -v keep="$KEEP" -v cutoff="$cutoff" -v self="$GITHUB_RUN_ID" '
+            {
+              id = $1; workflow = $2; name = $3; status = $4; created = $5; number = $6
+              if (id == self)            { next }
+              if (status != "completed") { print id "\t" name "\t" number "\t" created > "running.tsv"; next }
+              if (created >= cutoff)     { print id "\t" name "\t" number "\t" created > "young.tsv"; next }
+              seen[workflow]++
+              if (seen[workflow] <= keep + 0) { print id "\t" name "\t" number "\t" created > "kept.tsv"; next }
+              print id "\t" name "\t" number "\t" created > "doomed.tsv"
+            }
+          ' runs.tsv.sorted
+          for file in running.tsv young.tsv kept.tsv doomed.tsv; do
+            [ -f "$file" ] || : > "$file"
+          done
+
+          doomed="$(wc -l < doomed.tsv | tr -d ' ')"
+          kept="$(wc -l < kept.tsv | tr -d ' ')"
+          young="$(wc -l < young.tsv | tr -d ' ')"
+          running="$(wc -l < running.tsv | tr -d ' ')"
+          echo "to delete $doomed, kept $kept, too young $young, still running $running"
+          echo
+
+          deleted=0
+          failed=0
+          stopped=0
+          while IFS="$(printf '\t')" read -r id name number created; do
+            [ -n "$id" ] || continue
+            if [ "$deleted" -ge "$LIMIT" ]; then
+              stopped=$((stopped + 1))
+              continue
+            fi
+            label="$name #$number ($created, id $id)"
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "would delete $label"
+              deleted=$((deleted + 1))
+              continue
+            fi
+            if gh api -X DELETE "/repos/$GITHUB_REPOSITORY/actions/runs/$id" --silent 2>error.txt; then
+              echo "deleted      $label"
+              deleted=$((deleted + 1))
+              # Stay well inside the secondary rate limit for mutations.
+              sleep 0.4
+            else
+              sleep 5
+              if gh api -X DELETE "/repos/$GITHUB_REPOSITORY/actions/runs/$id" --silent 2>error.txt; then
+                echo "deleted      $label (on the second attempt)"
+                deleted=$((deleted + 1))
+              else
+                failed=$((failed + 1))
+                echo "::warning::could not delete $label: $(tr '\n' ' ' < error.txt)"
+              fi
+            fi
+          done < doomed.tsv
+
+          echo "::notice title=Purge::deleted $deleted of $total run(s) — kept $kept, $young too young, $running still running, $stopped over the limit, $failed failed"
+
+          {
+            echo "### Purged workflow runs"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Runs found | $total |"
+            echo "| Deleted | $deleted$([ "$DRY_RUN" = "true" ] && echo ' (dry run — nothing was deleted)') |"
+            echo "| Kept (newest $KEEP per workflow) | $kept |"
+            echo "| Younger than the cutoff | $young |"
+            echo "| Still running | $running |"
+            echo "| Over the limit, left for next time | $stopped |"
+            echo "| Failed | $failed |"
+            echo
+            echo "This run ($GITHUB_RUN_ID) is never deleted; the next purge takes it."
+            echo "Releases, tags and their assets are untouched — that is where the APK lives."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -55,7 +55,10 @@ RUN OPTIONS:
     --verbose                 Print the guest's log when it stops
     --tolerate-undefined      Skip over unknown instructions instead of stopping
     --screenshot <file.bmp>   Write the last presented frame
-    --serve <port>            Serve a live framebuffer preview on 0.0.0.0:<port>
+    --serve <port>            Serve a live framebuffer preview on <port>
+    --bind <addr>             Address the preview binds to (default 0.0.0.0,
+                              or $SIMPSONS_EMU_SERVE_HOST)
+    --keep-serving            Keep the preview up after the guest stops
     --stats                   Print call statistics
 ";
 
@@ -125,6 +128,18 @@ fn command_line(args: &[String]) -> Vec<String> {
             .cloned()
             .collect(),
         None => Vec::new(),
+    }
+}
+
+/// Where the preview server listens: `--bind`, else `SIMPSONS_EMU_SERVE_HOST`,
+/// else every interface (what the sandbox's preview proxy needs).
+fn serve_host(args: &[String]) -> String {
+    if let Some(host) = flag(args, "--bind") {
+        return host.to_string();
+    }
+    match std::env::var("SIMPSONS_EMU_SERVE_HOST") {
+        Ok(host) if !host.is_empty() => host,
+        _ => "0.0.0.0".to_string(),
     }
 }
 
@@ -349,8 +364,13 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(port) = serve_port {
         let games = import::options_from(args).root.unwrap_or_else(ipa::default_root);
-        serve::start(port, Arc::clone(&frames), Arc::clone(&logs), games)?;
-        println!("preview: http://0.0.0.0:{port}/  (open the port's preview URL)");
+        // Everything but a sandbox wants this on loopback; the Android app
+        // passes `--bind 127.0.0.1` so the preview is not on the user's Wi-Fi.
+        // `SIMPSONS_EMU_SERVE_HOST` does the same for embedders that cannot
+        // control the command line.
+        let host = serve_host(args);
+        serve::start(&host, port, Arc::clone(&frames), Arc::clone(&logs), games)?;
+        println!("preview: http://{host}:{port}/  (open the port's preview URL)");
     }
 
     println!("loaded {path}: {} bytes", image.data.len());
@@ -445,6 +465,20 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             println!("\n--- bound imports ({} symbols) ---", machine.image.imports.len());
             for import in machine.image.imports.iter().take(40) {
                 println!("  {:<40} slot {:#010x} -> {:#010x}", import.symbol, import.slot, import.trampoline);
+            }
+        }
+    }
+
+    // The guest stopping does not have to take the preview with it: the last
+    // frame, the log and the import panel are worth more after the run than
+    // during it.  The Android app relies on this — a guest that exits in
+    // milliseconds would otherwise never show a preview at all.
+    if let Some(port) = serve_port {
+        if args.iter().any(|a| a == "--keep-serving") {
+            let host = serve_host(args);
+            println!("\npreview still serving on http://{host}:{port}/ — interrupt to stop");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
             }
         }
     }

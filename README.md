@@ -13,7 +13,7 @@ emulator/                      the emulator itself (std-only Rust workspace)
   crates/runtime/              loader, syscall layer, HLE for the iOS frameworks
   crates/ipa/                  .ipa reader: ZIP, DEFLATE, plist, validation, import
   crates/cli/                  `simpsons-emu import | games | info | dump | run`
-android/                       installable Android launcher and Gradle APK project
+android/                       Android app that runs the emulator on a phone
 ```
 
 The C listing was used as the behavioural reference (symbol surface, syscall
@@ -177,40 +177,58 @@ misc-control space being decoded as a branch).
 
 The workflows live in `.github/workflows/`:
 
-* **`android.yml`** — tests the Rust workspace, cross-compiles `simpsons-emu`
-  for `arm64-v8a`, `armeabi-v7a`, `x86_64` and `x86`, then packages those binaries
-  with the Android launcher as one signed, installable universal APK. It runs on
-  relevant pushes and pull requests, or on demand from the *Actions* tab.
-  Download `SimpsonsSwift-android-apk` from the run's artifacts.
-* **`cleanup-workflow-runs.yml`** — every three hours (UTC), removes all
-  **completed workflow runs** and their logs/artifacts from the repository.
-  Queued and in-progress runs are preserved, as are the workflow definition
-  files. The scheduled workflow must be present on the repository's default
-  branch; repository/organization settings must allow its requested Actions write
-  permission for `GITHUB_TOKEN`.
+* **`android.yml`** — builds the APK.  Runs on a push to `main`, on a `v*` tag
+  and from the *Actions* tab.  It cross-compiles `simpsons-emu` for `arm64-v8a`,
+  `armeabi-v7a`, `x86_64` and `x86` with the NDK the runner already ships, builds
+  the demo image, assembles and signs `android/`, checks the result really is a
+  signed APK carrying all four binaries, and attaches it to the run *and* to the
+  rolling `android-latest` release.  A last, non-blocking job installs that APK
+  on an Android emulator, launches it, and checks that the packaged binary boots
+  the demo and that the preview reaches the app's `WebView` — the screenshot and
+  the device log are attached to the run.  See [Android](#android).
+* **`cleanup-runs.yml`** — deletes old workflow runs every three hours
+  (`cron: 0 */3 * * *`), keeping only the run doing the deleting.  Dispatch it by
+  hand to keep the newest few per workflow, to protect recent runs, or to do a
+  dry run.  It never touches releases or tags, which is why the APK is published
+  as a release asset: deleting a run deletes its artifacts with it.  GitHub only
+  runs schedules from the default branch, so this has to be on `main` to fire.
 
-### Building for Android
+## Android
 
-The Android project under `android/` is a small Java launcher around the actual
-Rust CLI. It lets you select a decrypted IPA through Android's document picker,
-imports it into private app storage, launches the matching ABI's emulator binary,
-and displays the emulator's local framebuffer/log preview in a WebView. The
-workflow produces one universal APK containing all four supported Android ABIs;
-it is debug-key signed so it can be installed directly for sideload testing.
+[`android/`](android/README.md) is a small, dependency-free app around the
+emulator: the APK carries the ordinary `simpsons-emu` binary as
+`lib/<abi>/libsimpsons-emu.so` (the only place Android still allows an exec),
+runs it, pipes its output into a log view, and points a `WebView` at the live
+framebuffer the emulator serves on loopback.
 
-The APK contains **no game binary or game assets**. Choose a decrypted copy of
-*The Simpsons Arcade* that you obtained yourself after installing. The imported
-IPA is removed from the app's temporary cache after import; the validated bundle
-is retained in private app storage. The real game's end-to-end compatibility
-remains unverified, as described above.
+Install the APK from the `android-latest` release, then
 
-To build locally, install JDK 17, Android SDK platform 35, NDK `27.2.12479018`,
-Gradle 8.9, and the four Rust Android targets. Cross-compile `simpsons-emu` with
-the NDK clang linkers and stage each executable as
-`android/app/src/main/jniLibs/<abi>/libsimpsons-emu.so`; then run
-`gradle -p android :app:assembleRelease`. Gradle fails early if any ABI binary
-is missing, rather than silently producing an APK that cannot launch the
-emulator.
+* **Demo** boots the synthetic ARMv7 Mach-O that ships in the APK — the loader,
+  the interpreter and the HLE, with no copyrighted file involved;
+* **Import .ipa** runs the emulator's own importer, with the same validation as
+  the desktop CLI, on a decrypted copy of the game that you supply;
+* **Play** runs what you imported.
+
+The imported bundle lives in the app's private storage, the staged `.ipa` copy
+is deleted once the import finishes, and nothing is ever uploaded anywhere.
+
+Cross-compiling by hand, if you would rather not use CI:
+
+```sh
+cd emulator
+rustup target add aarch64-linux-android
+export NDK="$ANDROID_NDK_HOME"                       # or the NDK you installed
+export CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+cat >> ~/.cargo/config.toml <<EOF
+[target.aarch64-linux-android]
+linker = "$CC"
+EOF
+cargo build --release --target aarch64-linux-android --bin simpsons-emu
+```
+
+That binary runs on a device on its own, too — `adb push` it to
+`/data/local/tmp/` and use it exactly like the desktop CLI.  The game is never
+part of any artifact: import your own decrypted copy with `simpsons-emu import`.
 
 ## Architecture notes
 
