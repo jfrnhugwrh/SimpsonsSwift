@@ -33,18 +33,18 @@ jobs:
 
       - name: cargo check
         run: |
+          set +e
           set -o pipefail
           (cd emulator && cargo check --workspace --all-targets --locked --offline) 2>&1 | tee /tmp/check.log
           status=${PIPESTATUS[0]}
-          echo "::error title=CHECK_STEP_AFTER_CARGO::cargo exited $status"
           if [ "$status" -ne 0 ]; then
             python3 .github/scripts/surface-log.py /tmp/check.log "CHECK"
-            echo "::error title=CHECK_STEP_AFTER_SCRIPT::script exited $?"
             exit "$status"
           fi
 
       - name: cargo test
         run: |
+          set +e
           set -o pipefail
           (cd emulator && cargo test --workspace --locked --offline) 2>&1 | tee /tmp/test.log
           status=${PIPESTATUS[0]}
