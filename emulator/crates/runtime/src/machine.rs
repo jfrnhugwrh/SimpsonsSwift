@@ -72,7 +72,7 @@ impl Machine {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        Ok(Machine {
+        let mut machine = Machine {
             cpu,
             mem,
             image,
@@ -83,7 +83,12 @@ impl Machine {
             trace: false,
             tolerate_undefined: false,
             since_present: 0,
-        })
+        };
+        // The Objective-C bridge learns the image's classes and selectors now,
+        // with the final, bound memory image — `objc_msgSend` has a registry to
+        // fall back on before a single instruction runs.
+        objc::install_image_metadata(&mut machine);
+        Ok(machine)
     }
 
     /// Run until the guest exits, the budget runs out, or a trap stops us.
@@ -107,10 +112,27 @@ impl Machine {
                 self.since_present += 1;
                 continue;
             }
-            // A guest method returning into a host caller.
+            // A guest method returning into a host caller.  The shadow return
+            // stack holds the address pushed when the HLE side handed control
+            // to the method; if it has run dry, stop at the caller instead of
+            // returning to 0 (which is where the boot fault came from).
             if pc == HLE_RETURN {
-                let target = self.sys.return_stack.pop().unwrap_or(0);
-                self.cpu.set_pc(target);
+                match self.sys.return_stack.pop() {
+                    Some(target) if target != 0 => {
+                        self.cpu.jump_to(target);
+                    }
+                    _ => {
+                        let context = if self.sys.objc.last_dispatch.is_empty() {
+                            "no Objective-C dispatch has happened yet".to_string()
+                        } else {
+                            format!("last Objective-C dispatch: {}", self.sys.objc.last_dispatch)
+                        };
+                        self.log(format!(
+                            "HLE_RETURN with an empty shadow return stack ({context}); treating the thread as finished"
+                        ));
+                        self.stop = Some(StopReason::Idle);
+                    }
+                }
                 continue;
             }
 
@@ -178,6 +200,15 @@ impl Machine {
                 self.log(format!(
                     "memory fault ({access:?}) at {address:#010x} from pc {pc:#010x}: {error}"
                 ));
+                if access == Access::Fetch {
+                    // A fetch fault is where a bad control transfer finally
+                    // reports: dump everything the host knows, because the
+                    // caller that handed over the wrong address is what the
+                    // developer actually needs to see.
+                    for line in self.fetch_fault_context(address, pc) {
+                        self.log(line);
+                    }
+                }
                 if access == Access::Fetch && self.tolerate_undefined {
                     self.cpu.set_pc(pc.wrapping_add(if self.cpu.thumb() { 2 } else { 4 }));
                 } else {
@@ -186,6 +217,58 @@ impl Machine {
             }
         }
         Ok(())
+    }
+
+    /// Everything useful for diagnosing a fetch that faulted: registers, the
+    /// last Objective-C dispatch, the shadow return stack, and the recent hosts
+    /// (a NULL IMP's dispatch line almost always shows up here).
+    fn fetch_fault_context(&self, address: u32, pc: u32) -> Vec<String> {
+        let mut lines = Vec::new();
+        if address == 0 || pc == 0 {
+            lines.push(
+                "control reached 0x0: a NULL IMP, a nil return used as a function pointer, \
+                 or a lost HLE return address"
+                    .to_string(),
+            );
+        }
+        lines.push(format!(
+            "r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r7={:#010x} sp={:#010x} lr={:#010x} cpsr={:#x}",
+            self.cpu.r[0],
+            self.cpu.r[1],
+            self.cpu.r[2],
+            self.cpu.r[3],
+            self.cpu.r[4],
+            self.cpu.r[7],
+            self.cpu.r[13],
+            self.cpu.r[14],
+            self.cpu.cpsr,
+        ));
+        lines.push(format!(
+            "objc: {}",
+            objc::report(&self.sys)
+        ));
+        if !self.sys.return_stack.is_empty() {
+            let top: Vec<String> = self
+                .sys
+                .return_stack
+                .iter()
+                .rev()
+                .take(8)
+                .map(|a| format!("{a:#010x}"))
+                .collect();
+            lines.push(format!(
+                "shadow return stack ({} deep, top first): {}",
+                self.sys.return_stack.len(),
+                top.join(" ")
+            ));
+        }
+        if !self.sys.recent_calls.is_empty() {
+            lines.push("recent host activity (oldest first):".to_string());
+            for call in self.sys.recent_calls.iter() {
+                lines.push(format!("  {call}"));
+            }
+        }
+        lines
     }
 
     /// Call the HLE implementation of `symbol`.
@@ -206,6 +289,17 @@ impl Machine {
                 self.cpu.r[14]
             ));
         }
+        {
+            let summary = format!(
+                "{}({:#x}, {:#x}, {:#x}, {:#x})",
+                hle::normalize(symbol),
+                self.cpu.r[0],
+                self.cpu.r[1],
+                self.cpu.r[2],
+                self.cpu.r[3],
+            );
+            self.sys.note_recent(summary);
+        }
         let handler = hle::lookup(symbol);
         let return_address = self.cpu.r[14];
         let mut hle = hle::Hle {
@@ -222,12 +316,41 @@ impl Machine {
         match hle.jump {
             Some(target) => {
                 // Control was handed to the guest; anything it returns comes
-                // back through `HLE_RETURN`.
-                hle.cpu.set_pc(target);
+                // back through `HLE_RETURN`.  `Hle::call_guest` already
+                // validated the target, but the PC never takes an address the
+                // emulator cannot execute from.
+                if objc::valid_method_target(&hle, target) {
+                    hle.cpu.jump_to(target);
+                } else {
+                    hle.cpu.r[0] = 0;
+                    hle.sys.note_recent(format!("{symbol}: refused guest jump to {target:#x}"));
+                    if return_address != 0 {
+                        hle.cpu.jump_to(return_address);
+                    } else {
+                        hle.sys.finished = true;
+                        hle.sys.exit_code = Some(1);
+                    }
+                    drop(hle);
+                    self.log(format!(
+                        "{symbol}: refusing to enter guest code at {target:#x}; answered with nil"
+                    ));
+                }
             }
             None => {
                 hle.cpu.r[0] = value;
-                hle.cpu.set_pc(return_address);
+                // The link register is where control resumes; a NULL one here
+                // is how the guest *would* branch to 0 — stop at the watchdog
+                // print instead of executing the address.
+                if return_address == 0 {
+                    hle.sys.finished = true;
+                    hle.sys.exit_code = Some(1);
+                    drop(hle);
+                    self.log(format!(
+                        "{symbol}: called with a NULL link register; treating the thread as finished"
+                    ));
+                } else {
+                    hle.cpu.jump_to(return_address);
+                }
             }
         }
         if self.sys.finished && self.stop.is_none() {
@@ -252,17 +375,16 @@ impl Machine {
     /// returns to `HLE_RETURN`.
     pub fn call_function(&mut self, address: u32, args: &[u32], budget: u64) -> Result<u32> {
         let saved = self.cpu.clone();
-        let saved_branch = self.cpu.pc();
+        // The sentinel marks where control must not escape: the callee's own
+        // return pops it, and nested HLE-transferred returns sit on top of it.
         self.sys.return_stack.push(0);
+        let base_depth = self.sys.return_stack.len();
         self.cpu.r[14] = HLE_RETURN;
         for (i, value) in args.iter().enumerate().take(4) {
             self.cpu.r[i] = *value;
         }
         // r4-r11 must be preserved by the callee, so nothing to save there.
-        self.cpu.set_pc(address & !1);
-        if address & 1 != 0 {
-            self.cpu.cpsr |= arm::FLAG_T;
-        }
+        self.cpu.jump_to(address);
 
         let mut executed = 0u64;
         let result = loop {
@@ -274,8 +396,19 @@ impl Machine {
             executed += 1;
             let pc = self.cpu.pc();
             if pc == HLE_RETURN {
-                let value = self.cpu.r[0];
-                break Ok(value);
+                if self.sys.return_stack.len() <= base_depth {
+                    let value = self.cpu.r[0];
+                    break Ok(value);
+                }
+                // A nested HLE call transferred deeper: finish its return.
+                let target = self.sys.return_stack.pop().unwrap_or(0);
+                if target == 0 {
+                    break Err(RuntimeError::Unsupported(format!(
+                        "function at {address:#010x} lost a nested return address"
+                    )));
+                }
+                self.cpu.jump_to(target);
+                continue;
             }
             if let Some(symbol) = self.image.symbol_at_trampoline(pc) {
                 let symbol = symbol.to_string();
@@ -293,10 +426,8 @@ impl Machine {
             }
         };
 
-        let result = result;
-        let _ = saved_branch;
         self.cpu = saved;
-        self.sys.return_stack.pop();
+        self.sys.return_stack.truncate(base_depth - 1);
         result
     }
 

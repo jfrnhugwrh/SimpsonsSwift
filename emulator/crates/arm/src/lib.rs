@@ -227,6 +227,34 @@ impl Cpu {
         }
     }
 
+    /// Branch that takes effect *now*, instead of at the end of the instruction
+    /// currently being executed.
+    ///
+    /// [`Cpu::branch_to`] only records the target in [`Cpu::branch`], which
+    /// `step_arm`/`step_thumb` consume when they finish the instruction they are
+    /// running — and both clear `branch` right after fetching.  A runtime that
+    /// redirects the guest *between* instructions (returning from a HLE call,
+    /// jumping to an Objective-C IMP) therefore has to write `r15` itself.
+    ///
+    /// `BX`/`BLX` semantics apply: bit 0 of the target selects the instruction
+    /// set.  Writing `r15` without also fixing the T bit is what turns a return
+    /// into a Thumb caller into an ARM fetch at an odd address, so callers that
+    /// hold a link register must use this rather than [`Cpu::set_pc`].  Any open
+    /// `IT` block is discarded, because a control transfer leaves the block the
+    /// `IT` was opened in.
+    #[inline]
+    pub fn jump_to(&mut self, target: u32) {
+        self.branch = None;
+        self.it = ItBlock::default();
+        if target & 1 != 0 {
+            self.cpsr |= FLAG_T;
+            self.r[15] = target & !1;
+        } else {
+            self.cpsr &= !FLAG_T;
+            self.r[15] = target & !3;
+        }
+    }
+
     /// Branch that stays in the current instruction set (`B`, `BL`, `ldr pc`,
     /// `add pc, ...`).  Only BX/BLX and the exception return take the new state
     /// from the target's bit 0, so this must not clear the T bit just because

@@ -100,14 +100,9 @@ fn cg_bitmap_context_create(hle: &mut Hle<'_>) -> Result<u32> {
 fn ui_application_main(hle: &mut Hle<'_>) -> Result<u32> {
     let delegate = if hle.arg(3) != 0 {
         let class = hle.arg(3);
-        // The delegate is a class name string here; keep it for the runtime.
-        let text = hle
-            .sys
-            .cf_strings
-            .get(&class)
-            .cloned()
-            .or_else(|| hle.cstr(class).ok())
-            .unwrap_or_default();
+        // The delegate name arrives as an NSString — usually a compile-time
+        // `__CFString` in the image, occasionally a heap CFString.
+        let text = crate::hle::objc::cf_string_text(hle, class).unwrap_or_default();
         hle.sys.app_delegate_class = text.clone();
         hle.note(format!("UIApplicationMain: delegate = {text}"));
         text
@@ -217,6 +212,31 @@ fn empty_string(hle: &mut Hle<'_>, _receiver: u32) -> Result<u32> {
     crate::hle::write_guest_cstring(hle, "")
 }
 
+/// `+[NSString stringWithUTF8String:]`: mirror the C string into a host string.
+fn nsstring_from_cstring(hle: &mut Hle<'_>, _receiver: u32) -> Result<u32> {
+    let ptr = hle.arg(2);
+    let text = if ptr != 0 { hle.cstr(ptr).unwrap_or_default() } else { String::new() };
+    crate::hle::objc::make_nsstring(hle, &text)
+}
+
+/// Answer an empty (but real) NSString for calls whose formatting we do not
+/// implement (`stringWithFormat:` and friends).
+fn nsstring_empty(hle: &mut Hle<'_>, _receiver: u32) -> Result<u32> {
+    crate::hle::objc::make_nsstring(hle, "")
+}
+
+/// Pass the receiver through for string combinators (`appending...`); the
+/// exact composition does not matter for the game's own glue.
+fn nsstring_self(hle: &mut Hle<'_>, receiver: u32) -> Result<u32> {
+    Ok(receiver)
+}
+
+/// `-[NSString UTF8String]`: the bytes of the host mirror as a C string.
+fn nsstring_utf8(hle: &mut Hle<'_>, receiver: u32) -> Result<u32> {
+    let text = crate::hle::objc::cf_string_text(hle, receiver).unwrap_or_default();
+    crate::hle::write_guest_cstring(hle, &text)
+}
+
 pub const HOST_METHODS: &[(&str, &str, HostMethod)] = &[
     // --- object life cycle -------------------------------------------------
     ("UIApplication", "sharedApplication", uiapplication_shared),
@@ -277,10 +297,10 @@ pub const HOST_METHODS: &[(&str, &str, HostMethod)] = &[
     ("UIColor", "whiteColor", color_clear),
     ("UIColor", "colorWithRed:green:blue:alpha:", color_clear),
     // --- strings -----------------------------------------------------------
-    ("NSString", "stringWithUTF8String:", host_zero),
-    ("NSString", "stringWithFormat:", host_zero),
-    ("NSString", "stringByAppendingPathComponent:", host_zero),
-    ("NSString", "UTF8String", host_zero),
+    ("NSString", "stringWithUTF8String:", nsstring_from_cstring),
+    ("NSString", "stringWithFormat:", nsstring_empty),
+    ("NSString", "stringByAppendingPathComponent:", nsstring_self),
+    ("NSString", "UTF8String", nsstring_utf8),
     ("NSString", "length", one),
     ("NSString", "intValue", zero),
     ("NSString", "floatValue", zero),

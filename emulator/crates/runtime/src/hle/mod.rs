@@ -13,6 +13,7 @@
 //! (AAPCS base standard, §5.4), which is what [`VaList`] walks.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 
 use arm::{Cpu, Trap};
@@ -46,6 +47,15 @@ pub struct System {
     pub unimplemented: HashMap<String, u64>,
     /// Free-form diagnostics for `--verbose`.
     pub log: Vec<String>,
+    /// A small ring of the most recent host-side events (HLE calls, dispatches).
+    /// Printed around a trap — the instruction preceding a fetch fault at 0x0
+    /// is almost always the call whose return address went missing.
+    pub recent_calls: VecDeque<String>,
+    /// Mutable state of the Objective-C bridge (`objc_msgSend` & friends).
+    pub objc: crate::hle::objc::ObjcRuntime,
+    /// Verbosity of Objective-C dispatch logging: 0 silent, 1 failures,
+    /// 2 every dispatch (`--objc-quiet` .. `--objc-trace`).
+    pub objc_verbosity: usize,
     /// Argument vector, made available to `NSProcessInfo`-style calls.
     pub args: Vec<String>,
     /// Set when the guest calls `exit`/`abort`.
@@ -111,6 +121,9 @@ impl Default for System {
             stdout: Vec::new(),
             unimplemented: HashMap::new(),
             log: Vec::new(),
+            recent_calls: VecDeque::new(),
+            objc: crate::hle::objc::ObjcRuntime::default(),
+            objc_verbosity: 1,
             args: Vec::new(),
             exit_code: None,
             thread_id: 1,
@@ -140,6 +153,17 @@ impl Default for System {
             frames_presented: 0,
             frames_with_content: 0,
             finished: false,
+        }
+    }
+}
+
+impl System {
+    /// Record one line in the crash-diagnostics ring, at a fixed small size.
+    pub fn note_recent(&mut self, line: String) {
+        const RECENT: usize = 32;
+        self.recent_calls.push_back(line);
+        while self.recent_calls.len() > RECENT {
+            self.recent_calls.pop_front();
         }
     }
 }
@@ -248,11 +272,21 @@ pub struct Hle<'a> {
 impl<'a> Hle<'a> {
     /// Transfer control to guest code at `address`, arranging for its return to
     /// come back to whoever called this HLE function.
-    pub fn call_guest(&mut self, address: u32) {
+    ///
+    /// Returns `false` — with no transfer performed — when `address` is not a
+    /// place the guest can execute.  The caller must then answer the call
+    /// itself, because jumping there anyway is precisely how a NULL IMP (or a
+    /// HLE trampoline used as a function pointer) turns into a fetch fault at a
+    /// stray address.
+    pub fn call_guest(&mut self, address: u32) -> bool {
+        if !crate::hle::objc::valid_method_target(self, address) {
+            return false;
+        }
         let lr = self.cpu.r[14];
         self.sys.return_stack.push(lr);
         self.cpu.r[14] = crate::loader::HLE_RETURN;
         self.jump = Some(address);
+        true
     }
     pub fn arg(&self, index: usize) -> u32 {
         self.cpu.r[index]

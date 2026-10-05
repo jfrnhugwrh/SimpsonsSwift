@@ -66,12 +66,47 @@ pub const HLE_SIZE: u32 = HLE_SLOT_SIZE * HLE_SLOTS;
 /// it from a HLE call (see [`crate::hle::Hle::call_guest`]).
 pub const HLE_RETURN: u32 = HLE_BASE + HLE_SIZE - HLE_SLOT_SIZE;
 
+/// True when `addr` is one of the HLE trampoline slots.
+///
+/// The slots hold executable markers, not data, so anything that inspects a
+/// guest pointer (`is_probable_class`, `lookup_imp`, the vtable readers) has to
+/// be able to reject them instead of mis-reading a `udf` word as a structure.
+#[inline]
+pub fn is_trampoline_page(addr: u32) -> bool {
+    addr >= HLE_BASE && addr < HLE_BASE + HLE_SIZE
+}
+
+/// Where the loader materialises synthetic Objective-C class objects for the
+/// `_OBJC_CLASS_$_*` / `_OBJC_METACLASS_$_*` symbols the image imports.
+///
+/// These are *data* symbols: the guest loads the slot and hands the value to
+/// `objc_msgSend` as a receiver.  Binding them to a trampoline would give the
+/// runtime a page of `udf` words where a `struct objc_class` belongs, so they
+/// get a real (if method-less) class object here, in the gap between the
+/// trampoline page and the runtime's own object pool.
+pub const OBJC_CLASSES_BASE: u32 = 0x7001_0000;
+pub const OBJC_CLASSES_SIZE: u32 = 0x0001_0000;
+
 pub const STACK_TOP: u32 = 0x4000_0000;
+
+/// A synthetic Objective-C class the loader created for an imported class
+/// symbol, so that `objc_msgSend` sees a class object rather than a trampoline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostObjcClass {
+    /// The name with the `_OBJC_CLASS_$_` / `_OBJC_METACLASS_$_` prefix removed.
+    pub name: String,
+    /// Guest address of the class object.
+    pub class: u32,
+    /// Guest address of its metaclass (which carries the class methods).
+    pub metaclass: u32,
+}
 
 /// A bound import: the trampoline address and the symbol it stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportBinding {
-    /// Address written into the guest's `__nl_symbol_ptr`/`__la_symbol_ptr` slot.
+    /// Address written into the guest's `__nl_symbol_ptr`/`__la_symbol_ptr`
+    /// slot.  For an Objective-C class symbol this is the synthetic class object
+    /// rather than a trampoline (see [`synthetic_objc_class`]).
     pub trampoline: u32,
     /// Guest address of the pointer slot that was filled in.
     pub slot: u32,
@@ -105,6 +140,9 @@ pub struct LoadedImage {
     pub imports: Vec<ImportBinding>,
     /// `index -> symbol`, indexed by `(trampoline - HLE_BASE) / HLE_SLOT_SIZE`.
     pub trampolines: Vec<String>,
+    /// Synthetic class objects created for the imported `_OBJC_CLASS_$_*`
+    /// symbols, in the order they were first referenced.
+    pub objc_classes: Vec<HostObjcClass>,
     pub stack_top: u32,
     pub stack_size: u32,
 }
@@ -296,16 +334,85 @@ pub struct BindingPass {
     pub slots: HashMap<u32, String>,
     /// Symbols that are bound but for which no handler exists (diagnostics).
     pub unresolved: Vec<String>,
+    /// Synthetic Objective-C classes created for imported class symbols.
+    pub objc_classes: Vec<HostObjcClass>,
+}
+
+/// Split an imported Objective-C class symbol into `(name, is_metaclass)`.
+///
+/// The Mach-O names are `_OBJC_CLASS_$_X` and `_OBJC_METACLASS_$_X`; both refer
+/// to the same class, so they have to resolve to one `(class, metaclass)` pair.
+fn objc_class_symbol(symbol: &str) -> Option<(&str, bool)> {
+    if let Some(name) = symbol.strip_prefix("_OBJC_CLASS_$_") {
+        if !name.is_empty() {
+            return Some((name, false));
+        }
+    }
+    if let Some(name) = symbol.strip_prefix("_OBJC_METACLASS_$_") {
+        if !name.is_empty() {
+            return Some((name, true));
+        }
+    }
+    None
+}
+
+/// Materialise (once) the `(class, metaclass)` pair for an imported
+/// `_OBJC_CLASS_$_X`, and return the address the bind slot should hold.
+///
+/// Both objects are real `struct objc_class` values with a valid `class_ro_t`,
+/// so the Objective-C bridge's generic metadata reader accepts them: they simply
+/// have no methods of their own, which makes every message to them fall through
+/// to the emulator's host method tables (`-[UIDevice currentDevice]` and the
+/// rest) instead of dereferencing a trampoline.
+fn synthetic_objc_class(
+    space: &mut AddressSpace,
+    next: &mut u32,
+    created: &mut Vec<HostObjcClass>,
+    name: &str,
+    metaclass_wanted: bool,
+) -> Result<u32> {
+    if let Some(existing) = created.iter().find(|c| c.name == name) {
+        return Ok(if metaclass_wanted { existing.metaclass } else { existing.class });
+    }
+    let size = crate::hle::objc::synthetic_class_size(name);
+    // 16-byte aligned, and both objects have to fit in the pool.
+    let class = (*next + 15) & !15;
+    let metaclass = class + size;
+    if metaclass + size > OBJC_CLASSES_BASE + OBJC_CLASSES_SIZE {
+        return Err(RuntimeError::Unsupported(format!(
+            "out of room for synthetic Objective-C class objects (at `{name}`)"
+        )));
+    }
+    *next = metaclass + size;
+    // The root metaclass is its own isa and has no superclass, which is exactly
+    // how `NSObject`'s metaclass terminates the chain in libobjc.
+    crate::hle::objc::write_synthetic_class(space, metaclass, name, metaclass, 0, 0)?;
+    crate::hle::objc::write_synthetic_class(
+        space,
+        class,
+        name,
+        metaclass,
+        0,
+        crate::hle::objc::HOST_INSTANCE_SIZE,
+    )?;
+    created.push(HostObjcClass { name: name.to_string(), class, metaclass });
+    Ok(if metaclass_wanted { metaclass } else { class })
 }
 
 /// Write a HLE trampoline address into every import slot.
 ///
 /// Returns the pass results; trampoline indices are allocated in the order the
 /// symbols are first seen so the mapping is stable for a given image.
+///
+/// Objective-C class symbols are the exception: they are bound to synthetic
+/// class objects (see [`synthetic_objc_class`]) rather than to a trampoline,
+/// because the guest uses the slot's value as a message receiver and never calls
+/// it.
 pub fn apply_bindings(
     binds: &[BindRecord],
     space: &mut AddressSpace,
     trampolines: &mut Vec<String>,
+    objc_classes: &mut Vec<HostObjcClass>,
     _slide: u32,
 ) -> Result<BindingPass> {
     let mut index_of: HashMap<String, u32> = trampolines
@@ -316,8 +423,34 @@ pub fn apply_bindings(
     let mut imports = Vec::new();
     let mut slots = HashMap::new();
     let mut unresolved = Vec::new();
+    let mut next_class = OBJC_CLASSES_BASE;
 
     for bind in binds {
+        // A class symbol is data, not a function: give it a class object and do
+        // not spend a trampoline slot on it.
+        if let Some((name, metaclass_wanted)) = objc_class_symbol(&bind.symbol) {
+            let value = synthetic_objc_class(
+                space,
+                &mut next_class,
+                objc_classes,
+                name,
+                metaclass_wanted,
+            )?;
+            space.write_u32(bind.address, value.wrapping_add(bind.addend as u32))?;
+            slots.insert(bind.address, bind.symbol.clone());
+            imports.push(ImportBinding {
+                trampoline: value,
+                slot: bind.address,
+                symbol: bind.symbol.clone(),
+                ordinal: bind.dylib_ordinal,
+                lazy: bind.lazy,
+            });
+            if !unresolved.contains(&bind.symbol) {
+                unresolved.push(bind.symbol.clone());
+            }
+            continue;
+        }
+
         let index = match index_of.get(&bind.symbol) {
             Some(&i) => i,
             None => {
@@ -355,7 +488,7 @@ pub fn apply_bindings(
             unresolved.push(bind.symbol.clone());
         }
     }
-    Ok(BindingPass { imports, slots, unresolved })
+    Ok(BindingPass { imports, slots, unresolved, objc_classes: objc_classes.clone() })
 }
 
 /// Resolve `LC_MAIN`/`LC_UNIXTHREAD` into a start address, defaulting to the
@@ -404,8 +537,24 @@ pub fn load(macho: MachO, options: &LoadOptions) -> Result<(LoadedImage, Address
         &[],
     )?;
 
+    // Synthetic Objective-C class objects for the imported `_OBJC_CLASS_$_*`
+    // symbols.  Writable while they are being built, then dropped to read-only:
+    // a class object is constant data from the guest's point of view.
+    space.map(
+        "objc-classes",
+        OBJC_CLASSES_BASE,
+        OBJC_CLASSES_SIZE,
+        Permissions::RW,
+        RegionKind::Anonymous,
+        &[],
+    )?;
+
     let mut trampolines: Vec<String> = Vec::new();
-    let pass = apply_bindings(&binds, &mut space, &mut trampolines, slide)?;
+    let mut objc_classes: Vec<HostObjcClass> = Vec::new();
+    let pass = apply_bindings(&binds, &mut space, &mut trampolines, &mut objc_classes, slide)?;
+    if !objc_classes.is_empty() {
+        space.protect(OBJC_CLASSES_BASE, OBJC_CLASSES_SIZE, Permissions::R)?;
+    }
 
     // Fill each trampoline slot's body with a marker the disassembler shows up
     // as `udf`, so a wrong jump lands on a recognisable address.
@@ -448,6 +597,7 @@ pub fn load(macho: MachO, options: &LoadOptions) -> Result<(LoadedImage, Address
         rebases,
         imports: pass.imports,
         trampolines,
+        objc_classes: pass.objc_classes,
         stack_top,
         stack_size,
     };

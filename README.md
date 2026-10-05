@@ -112,6 +112,49 @@ an undefined instruction or a syscall/HLE call. `--tolerate-undefined` steps ove
 unknown instructions and logs them, which turns a hard stop into a list of what
 still has to be implemented.
 
+## The Objective-C runtime bridge
+
+The game is a C++ engine wrapped in a thin Objective-C layer (`EAGLView`,
+`RuntimeAppDelegate`, …), and every message goes through `objc_msgSend` — the
+decompilation calls it 747 times. The bridge in `crates/runtime/src/hle/objc.rs`
+implements the runtime surface:
+
+* **Class symbols are data, not code.** `_OBJC_CLASS_$_*` imports are
+  materialised as synthetic `struct objc_class` objects (in their own
+  `0x7001_0000` region) instead of being bound to trampolines, so
+  `+[UIDevice currentDevice]` behaves like messaging a real class.
+* **The image's own classes are real.** `__objc_classlist`,
+  `__objc_catlist` and `__objc_selrefs` are registered at boot; method
+  lookup walks the guest's own `method_list_t`s (both the modern
+  `class_ro_t` and legacy layouts), following the superclass chain for
+  instance methods and the metaclass chain for class methods.  A resolved
+  IMP is *executed by the guest interpreter*, and its return flows back to
+  the caller.
+* **Messaging `nil` is the ABI-exact no-op**: zero in `r0`/`r1`, and a
+  zeroed struct-return buffer for `objc_msgSend_stret`.
+* **Actionable failures.** A message with no implementation is reported
+  (once, with a count) and answered `nil` — never a jump to `0x0`.  Every
+  guest IMP entry is validated against mapped, executable memory first,
+  and HLE control returns go through a shadow return stack plus a
+  Thumb-strict `jump_to` on the CPU.
+* **The full runtime surface** — `objc_msgSend{,_stret,Super,Super2,_stret,_fpret}`,
+  `objc_getClass(…)`, `sel_registerName`, the `class_*`/`method_*`/`object_*`
+  reflection family, ARC-era `objc_storeStrong/Weak/…`, associated objects,
+  autorelease pools, sync / exception entry points and
+  `NSClassFromString` & friends.  See `docs/objc-runtime.md` for the
+  catalogue.
+
+Run diagnostics:
+
+```sh
+simpsons-emu run <ipa> --objc-trace     # every dispatch, with resolution
+simpsons-emu run <ipa> --objc-quiet     # only hard failures in the guest log
+simpsons-emu run <ipa> --stats          # guest-IMP/host/miss counts + miss table
+```
+
+Any instruction-fetch fault also prints the last dispatch, the shadow return
+stack and the recent HLE history, which is where a NULL IMP shows up.
+
 ## What is verified, and how
 
 `crates/arm/src/unicorn_golden.rs` is a generated table of **334 instruction
