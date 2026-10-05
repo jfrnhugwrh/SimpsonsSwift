@@ -52,6 +52,8 @@ RUN OPTIONS:
     --max-insns <n>           Instruction budget (default 200000000)
     --slice <n>               Instructions between frame publishes (default 2000000)
     --trace                   Log every HLE call and syscall
+    --objc-trace              Log every Objective-C dispatch (resolutions, hosts)
+    --objc-quiet              Only log Objective-C hard failures (never per-send)
     --verbose                 Print the guest's log when it stops
     --tolerate-undefined      Skip over unknown instructions instead of stopping
     --screenshot <file.bmp>   Write the last presented frame
@@ -338,6 +340,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 
     let trace = args.iter().any(|a| a == "--trace");
     let verbose = args.iter().any(|a| a == "--verbose");
+    let objc_trace = args.iter().any(|a| a == "--objc-trace");
+    let objc_quiet = args.iter().any(|a| a == "--objc-quiet");
     let tolerate = args.iter().any(|a| a == "--tolerate-undefined");
     let budget = number(args, "--max-insns", 200_000_000);
     let slice = number(args, "--slice", 2_000_000).max(1000);
@@ -357,6 +361,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let mut machine = Machine::boot(image, &options).map_err(|e| e.to_string())?;
     machine.trace = trace;
     machine.tolerate_undefined = tolerate;
+    if objc_trace {
+        machine.sys.objc_verbosity = runtime::hle::objc::VERBOSITY_EVERY_CALL;
+    } else if objc_quiet {
+        machine.sys.objc_verbosity = 0;
+    }
     println!(
         "mapped {} segments, {} imports bound to HLE trampolines at {:#010x}",
         machine.image.segments.len(),
@@ -427,6 +436,25 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 
     if stats {
+        println!("\n--- Objective-C runtime ---");
+        println!("  {}", runtime::hle::objc::report(&machine.sys));
+        if !machine.sys.objc.unrecognized.is_empty() {
+            println!("  unrecognized selectors:");
+            let mut missing: Vec<_> = machine.sys.objc.unrecognized.iter().collect();
+            missing.sort_by(|a, b| b.1.cmp(a.1));
+            for (name, count) in missing.iter().take(20) {
+                println!("    {count:>8}  {name}");
+            }
+        }
+        if !machine.sys.objc.nil_messages.is_empty() {
+            let mut nil: Vec<_> = machine.sys.objc.nil_messages.iter().collect();
+            nil.sort_by(|a, b| b.1.cmp(a.1));
+            println!("  messages sent to nil (legal no-ops):");
+            for (name, count) in nil.iter().take(10) {
+                println!("    {count:>8}  {name}");
+            }
+        }
+
         println!("\n--- most called HLE symbols ---");
         let mut calls = machine.stats.hle_by_symbol.clone();
         calls.sort_by(|a, b| b.1.cmp(&a.1));
